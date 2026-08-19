@@ -461,12 +461,12 @@ const PLAN_ORDER = {
 };
 
 // Serve static pages
-app.get('/dashboard', (req, res) => {
-    res.sendFile(path.join(__dirname, 'https://nexus.pxxlspace.cv/Dashboard/index.html'));
+app.get('/', (req, res) => {
+    res.redirect('https://nexus.pxxlspace.cv');
 });
 
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'https://nexus.pxxlspace.cv/index.html'));
+app.get('/dashboard', (req, res) => {
+    res.redirect('https://nexus.pxxlspace.cv/Dashboard/index.html');
 });
 
 const PLAN_PRICES = Object.fromEntries(
