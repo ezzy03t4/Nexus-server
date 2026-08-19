@@ -24,6 +24,7 @@ const allowedOrigins = [
   'http://localhost:5500',
   'http://localhost:5000',
   'https://nexus.pxxlspace.cv',
+  'https://nexus.pxxl.click',
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
