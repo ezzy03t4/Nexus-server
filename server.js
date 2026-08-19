@@ -460,7 +460,7 @@ const PLAN_ORDER = {
   Titan: 6
 };
 
-// Serve static pages
+// Serve static pages (redirect to hosted frontend)
 app.get('/', (req, res) => {
     res.redirect('https://nexus.pxxlspace.cv');
 });
@@ -1571,7 +1571,9 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         `, user.id, depositAmount, reference, 'pending');
         const transactionId = info.lastInsertRowid;
 
-        const redirectUrl = `http://localhost:5000/api/deposit/verify/${reference}`;
+        // 🔥 FIX: Use environment variable for backend URL
+        const backendUrl = process.env.BACKEND_URL || 'http://localhost:5000';
+        const redirectUrl = `${backendUrl}/api/deposit/verify/${reference}`;
 
         const payload = {
             tx_ref: reference,
