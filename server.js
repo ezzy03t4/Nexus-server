@@ -19,27 +19,23 @@ const fs = require('fs');
 // EXPRESS APP
 // ================================================================
 const app = express();
-// Allow multiple origins (including your local Live Server)
 const allowedOrigins = [
   'http://127.0.0.1:5500',
   'http://localhost:5500',
   'http://localhost:5000',
   'https://nexus.pxxlspace.cv',
   process.env.FRONTEND_URL
-].filter(Boolean); // remove undefined
+].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
     if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
     }
-  },
-  // If you need credentials (cookies), uncomment:
-  // credentials: true
+  }
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -60,7 +56,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (allowed.includes(file.mimetype)) cb(null, true);
@@ -78,23 +74,19 @@ const RATE_LIMIT_MAX = 100;
 const rateLimiter = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress;
   const now = Date.now();
-
   if (!rateLimits[ip]) {
     rateLimits[ip] = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
     return next();
   }
-
   if (now > rateLimits[ip].resetTime) {
     rateLimits[ip].count = 1;
     rateLimits[ip].resetTime = now + RATE_LIMIT_WINDOW;
     return next();
   }
-
   rateLimits[ip].count++;
   if (rateLimits[ip].count > RATE_LIMIT_MAX) {
     return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
-
   next();
 };
 
@@ -111,176 +103,47 @@ app.use(rateLimiter);
 // SQLITE DATABASE (with full schema and migrations) - using sqlite3
 // ================================================================
 const db = new sqlite3.Database(process.env.DATABASE_PATH || 'database.sqlite');
-// Enable foreign keys
 db.run('PRAGMA foreign_keys = ON');
 
-// Promisify db methods for async/await
 db.getAsync = promisify(db.get).bind(db);
 db.allAsync = promisify(db.all).bind(db);
 db.runAsync = promisify(db.run).bind(db);
 db.execAsync = promisify(db.exec).bind(db);
 
-// Helper to run schema migrations (synchronous - we can use execAsync with await)
+// ================================================================
+// INITIALIZE DATABASE (ROBUST – never crashes)
+// ================================================================
 async function initDatabase() {
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password TEXT NOT NULL,
-      country TEXT NOT NULL,
-      phone TEXT DEFAULT '',
-      selectedPlan TEXT DEFAULT NULL,
-      balance REAL DEFAULT 0,
-      profilePicture TEXT DEFAULT NULL,
-      isAdmin INTEGER DEFAULT 0,
-      blocked INTEGER DEFAULT 0,
-      verified INTEGER DEFAULT 0,
-      verificationCode TEXT DEFAULT NULL,
-      verificationCodeExpires INTEGER DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now'))
-    )
-  `);
+  console.log('🔄 Running database schema migrations...');
 
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS transactions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
-      amount REAL NOT NULL,
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
-      method TEXT DEFAULT NULL,
-      description TEXT DEFAULT '',
-      reference TEXT DEFAULT NULL,
-      proof TEXT DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      completedAt INTEGER DEFAULT NULL,
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS notifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      title TEXT NOT NULL,
-      message TEXT NOT NULL,
-      type TEXT DEFAULT 'info',
-      isRead INTEGER DEFAULT 0,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      token TEXT NOT NULL UNIQUE,
-      expiresAt INTEGER NOT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS daily_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      date TEXT NOT NULL,
-      action TEXT NOT NULL,
-      count INTEGER DEFAULT 0,
-      UNIQUE(userId, date, action),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS holdings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      symbol TEXT NOT NULL,
-      amount REAL NOT NULL,
-      averagePrice REAL NOT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
-      UNIQUE(userId, symbol)
-    )
-  `);
-
-  await db.execAsync(`
-    CREATE TABLE IF NOT EXISTS support_tickets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      subject TEXT NOT NULL,
-      category TEXT NOT NULL,
-      priority TEXT NOT NULL,
-      message TEXT NOT NULL,
-      attachment TEXT DEFAULT NULL,
-      status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
-      adminReply TEXT DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  // ---- Migrations: ensure all columns exist ----
-  // Users table
-  const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
-  const existingUserCols = userTableInfo.map(c => c.name);
-  const userColumnsToAdd = [
-    { name: 'profilePicture', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'selectedPlan', type: 'TEXT DEFAULT NULL' },
-    { name: 'balance', type: 'REAL DEFAULT 0' },
-    { name: 'isAdmin', type: 'INTEGER DEFAULT 0' },
-    { name: 'blocked', type: 'INTEGER DEFAULT 0' },
-    { name: 'verified', type: 'INTEGER DEFAULT 0' },
-    { name: 'verificationCode', type: 'TEXT DEFAULT NULL' },
-    { name: 'verificationCodeExpires', type: 'INTEGER DEFAULT NULL' }
-  ];
-  for (const col of userColumnsToAdd) {
-    if (!existingUserCols.includes(col.name)) {
-      console.log(`🔄 Adding ${col.name} column to users...`);
-      await db.execAsync(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
-    }
-  }
-  await db.execAsync('UPDATE users SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-  // Transactions table
-  const txTableInfo = await db.allAsync("PRAGMA table_info(transactions)");
-  const existingTxCols = txTableInfo.map(c => c.name);
-  const txColumnsToAdd = [
-    { name: 'proof', type: 'TEXT DEFAULT NULL' },
-    { name: 'description', type: 'TEXT DEFAULT ""' },
-    { name: 'completedAt', type: 'INTEGER DEFAULT NULL' },
-    { name: 'method', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'currency', type: 'TEXT DEFAULT "USD"' },
-    { name: 'originalAmount', type: 'REAL DEFAULT 0' },
-    { name: 'exchangeRate', type: 'REAL DEFAULT 1' },
-    { name: 'feePercent', type: 'REAL DEFAULT 0' },
-    { name: 'feeAmount', type: 'REAL DEFAULT 0' }
-  ];
-  for (const col of txColumnsToAdd) {
-    if (!existingTxCols.includes(col.name)) {
-      console.log(`🔄 Adding ${col.name} column to transactions...`);
-      await db.execAsync(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
-    }
-  }
-  await db.execAsync('UPDATE transactions SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-  // Fix transactions CHECK constraint to include 'plan_purchase' if needed
-  const txCreateSql = await db.getAsync("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'");
-  if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
-    console.log('🔄 Recreating transactions table to add plan_purchase to CHECK constraint...');
-    await db.execAsync('BEGIN TRANSACTION');
+  // ---- CREATE TABLES (with try/catch for each) ----
+  try {
     await db.execAsync(`
-      CREATE TABLE transactions_new (
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL,
+        country TEXT NOT NULL,
+        phone TEXT DEFAULT '',
+        selectedPlan TEXT DEFAULT NULL,
+        balance REAL DEFAULT 0,
+        profilePicture TEXT DEFAULT NULL,
+        isAdmin INTEGER DEFAULT 0,
+        blocked INTEGER DEFAULT 0,
+        verified INTEGER DEFAULT 0,
+        verificationCode TEXT DEFAULT NULL,
+        verificationCodeExpires INTEGER DEFAULT NULL,
+        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+        updatedAt INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+    console.log('✅ Users table ready');
+  } catch (err) { console.warn('⚠️ Users table:', err.message); }
+
+  try {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         userId INTEGER NOT NULL,
         type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
@@ -290,52 +153,234 @@ async function initDatabase() {
         description TEXT DEFAULT '',
         reference TEXT DEFAULT NULL,
         proof TEXT DEFAULT NULL,
+        currency TEXT DEFAULT 'USD',
+        originalAmount REAL DEFAULT 0,
+        exchangeRate REAL DEFAULT 1,
+        feePercent REAL DEFAULT 0,
+        feeAmount REAL DEFAULT 0,
         createdAt INTEGER DEFAULT (strftime('%s', 'now')),
         updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
         completedAt INTEGER DEFAULT NULL,
         FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
       )
     `);
+    console.log('✅ Transactions table ready');
+  } catch (err) { console.warn('⚠️ Transactions table:', err.message); }
+
+  try {
     await db.execAsync(`
-      INSERT INTO transactions_new (
-        id, userId, type, amount, status, method, description,
-        reference, proof, createdAt, updatedAt, completedAt
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        type TEXT DEFAULT 'info',
+        isRead INTEGER DEFAULT 0,
+        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
       )
-      SELECT
-        id, userId, type, amount, status, method, description,
-        reference, proof, createdAt, updatedAt, completedAt
-      FROM transactions
     `);
-    await db.execAsync('DROP TABLE transactions');
-    await db.execAsync('ALTER TABLE transactions_new RENAME TO transactions');
-    await db.execAsync('COMMIT');
-    console.log('✅ transactions table recreated with updated CHECK constraint.');
-  }
+    console.log('✅ Notifications table ready');
+  } catch (err) { console.warn('⚠️ Notifications table:', err.message); }
 
-  // Support tickets migrations
-  const supportTableInfo = await db.allAsync("PRAGMA table_info(support_tickets)");
-  const existingSupportCols = supportTableInfo.map(c => c.name);
-  const supportColumnsToAdd = [
-    { name: 'attachment', type: 'TEXT DEFAULT NULL' },
-    { name: 'adminReply', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
-  ];
-  for (const col of supportColumnsToAdd) {
-    if (!existingSupportCols.includes(col.name)) {
-      console.log(`🔄 Adding ${col.name} column to support_tickets...`);
-      await db.execAsync(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
+  try {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        expiresAt INTEGER NOT NULL,
+        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    console.log('✅ Sessions table ready');
+  } catch (err) { console.warn('⚠️ Sessions table:', err.message); }
+
+  try {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS daily_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        action TEXT NOT NULL,
+        count INTEGER DEFAULT 0,
+        UNIQUE(userId, date, action),
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    console.log('✅ Daily usage table ready');
+  } catch (err) { console.warn('⚠️ Daily usage table:', err.message); }
+
+  try {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS holdings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        amount REAL NOT NULL,
+        averagePrice REAL NOT NULL,
+        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+        updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(userId, symbol)
+      )
+    `);
+    console.log('✅ Holdings table ready');
+  } catch (err) { console.warn('⚠️ Holdings table:', err.message); }
+
+  try {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS support_tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER NOT NULL,
+        subject TEXT NOT NULL,
+        category TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        message TEXT NOT NULL,
+        attachment TEXT DEFAULT NULL,
+        status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
+        adminReply TEXT DEFAULT NULL,
+        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+        updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    console.log('✅ Support tickets table ready');
+  } catch (err) { console.warn('⚠️ Support tickets table:', err.message); }
+
+  // ---- MIGRATIONS: add missing columns (safe try/catch) ----
+  try {
+    const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
+    const existingUserCols = userTableInfo.map(c => c.name);
+    const userColumnsToAdd = [
+      { name: 'profilePicture', type: 'TEXT DEFAULT NULL' },
+      { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
+      { name: 'selectedPlan', type: 'TEXT DEFAULT NULL' },
+      { name: 'balance', type: 'REAL DEFAULT 0' },
+      { name: 'isAdmin', type: 'INTEGER DEFAULT 0' },
+      { name: 'blocked', type: 'INTEGER DEFAULT 0' },
+      { name: 'verified', type: 'INTEGER DEFAULT 0' },
+      { name: 'verificationCode', type: 'TEXT DEFAULT NULL' },
+      { name: 'verificationCodeExpires', type: 'INTEGER DEFAULT NULL' }
+    ];
+    for (const col of userColumnsToAdd) {
+      if (!existingUserCols.includes(col.name)) {
+        try {
+          console.log(`🔄 Adding ${col.name} column to users...`);
+          await db.execAsync(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
+          console.log(`✅ ${col.name} column added.`);
+        } catch (err) {
+          console.warn(`⚠️ Could not add ${col.name} (ignored):`, err.message);
+        }
+      }
     }
-  }
-  await db.execAsync('UPDATE support_tickets SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-}
+    await db.execAsync('UPDATE users SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+    console.log('✅ Users migrations complete');
+  } catch (err) { console.warn('⚠️ Users migrations error:', err.message); }
 
-// Initialize database (run before starting server)
-initDatabase().then(() => {
+  try {
+    const txTableInfo = await db.allAsync("PRAGMA table_info(transactions)");
+    const existingTxCols = txTableInfo.map(c => c.name);
+    const txColumnsToAdd = [
+      { name: 'proof', type: 'TEXT DEFAULT NULL' },
+      { name: 'description', type: 'TEXT DEFAULT ""' },
+      { name: 'completedAt', type: 'INTEGER DEFAULT NULL' },
+      { name: 'method', type: 'TEXT DEFAULT NULL' },
+      { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
+      { name: 'currency', type: 'TEXT DEFAULT "USD"' },
+      { name: 'originalAmount', type: 'REAL DEFAULT 0' },
+      { name: 'exchangeRate', type: 'REAL DEFAULT 1' },
+      { name: 'feePercent', type: 'REAL DEFAULT 0' },
+      { name: 'feeAmount', type: 'REAL DEFAULT 0' }
+    ];
+    for (const col of txColumnsToAdd) {
+      if (!existingTxCols.includes(col.name)) {
+        try {
+          console.log(`🔄 Adding ${col.name} column to transactions...`);
+          await db.execAsync(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
+          console.log(`✅ ${col.name} column added.`);
+        } catch (err) {
+          console.warn(`⚠️ Could not add ${col.name} (ignored):`, err.message);
+        }
+      }
+    }
+    await db.execAsync('UPDATE transactions SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+    console.log('✅ Transactions migrations complete');
+  } catch (err) { console.warn('⚠️ Transactions migrations error:', err.message); }
+
+  try {
+    // Fix transactions CHECK constraint to include 'plan_purchase'
+    const txCreateSql = await db.getAsync("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'");
+    if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
+      console.log('🔄 Recreating transactions table to add plan_purchase...');
+      await db.execAsync('BEGIN TRANSACTION');
+      await db.execAsync(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          userId INTEGER NOT NULL,
+          type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
+          amount REAL NOT NULL,
+          status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
+          method TEXT DEFAULT NULL,
+          description TEXT DEFAULT '',
+          reference TEXT DEFAULT NULL,
+          proof TEXT DEFAULT NULL,
+          currency TEXT DEFAULT 'USD',
+          originalAmount REAL DEFAULT 0,
+          exchangeRate REAL DEFAULT 1,
+          feePercent REAL DEFAULT 0,
+          feeAmount REAL DEFAULT 0,
+          createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+          updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+          completedAt INTEGER DEFAULT NULL,
+          FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+        )
+      `);
+      await db.execAsync(`
+        INSERT INTO transactions_new (
+          id, userId, type, amount, status, method, description,
+          reference, proof, currency, originalAmount, exchangeRate,
+          feePercent, feeAmount, createdAt, updatedAt, completedAt
+        )
+        SELECT
+          id, userId, type, amount, status, method, description,
+          reference, proof, currency, originalAmount, exchangeRate,
+          feePercent, feeAmount, createdAt, updatedAt, completedAt
+        FROM transactions
+      `);
+      await db.execAsync('DROP TABLE transactions');
+      await db.execAsync('ALTER TABLE transactions_new RENAME TO transactions');
+      await db.execAsync('COMMIT');
+      console.log('✅ transactions table recreated with updated CHECK constraint.');
+    }
+  } catch (err) { console.warn('⚠️ Transactions CHECK constraint fix error:', err.message); }
+
+  try {
+    const supportTableInfo = await db.allAsync("PRAGMA table_info(support_tickets)");
+    const existingSupportCols = supportTableInfo.map(c => c.name);
+    const supportColumnsToAdd = [
+      { name: 'attachment', type: 'TEXT DEFAULT NULL' },
+      { name: 'adminReply', type: 'TEXT DEFAULT NULL' },
+      { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
+    ];
+    for (const col of supportColumnsToAdd) {
+      if (!existingSupportCols.includes(col.name)) {
+        try {
+          console.log(`🔄 Adding ${col.name} column to support_tickets...`);
+          await db.execAsync(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
+          console.log(`✅ ${col.name} column added.`);
+        } catch (err) {
+          console.warn(`⚠️ Could not add ${col.name} (ignored):`, err.message);
+        }
+      }
+    }
+    await db.execAsync('UPDATE support_tickets SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+    console.log('✅ Support tickets migrations complete');
+  } catch (err) { console.warn('⚠️ Support tickets migrations error:', err.message); }
+
   console.log('✅ Database schema and migrations applied.');
-}).catch(err => {
-  console.error('❌ Database initialization error:', err);
-  process.exit(1);
-});
+}
 
 // ================================================================
 // HELPERS
@@ -415,12 +460,11 @@ const PLAN_ORDER = {
   Titan: 6
 };
 
-// Serve the dashboard page
+// Serve static pages
 app.get('/dashboard', (req, res) => {
     res.sendFile(path.join(__dirname, 'https://nexus.pxxlspace.cv/Dashboard/index.html'));
 });
 
-// Serve the main page
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'https://nexus.pxxlspace.cv/index.html'));
 });
@@ -631,119 +675,6 @@ async function getCryptoPrices(symbols) {
 })();
 
 // ================================================================
-// PRICE & CONVERSION ROUTES
-// ================================================================
-
-app.get('/api/prices/:symbol', async (req, res) => {
-  try {
-    const symbol = req.params.symbol.toUpperCase();
-    if (!SUPPORTED_SYMBOLS.includes(symbol)) {
-      return res.status(400).json({ error: 'Unsupported symbol.' });
-    }
-    const prices = await getCryptoPrices([symbol]);
-    const price = prices[symbol];
-    if (!price) {
-      return res.status(404).json({ error: 'Price not available.' });
-    }
-    res.json({ symbol, price, timestamp: new Date().toISOString() });
-  } catch (error) {
-    log('error', 'Price fetch error', error);
-    res.status(500).json({ error: 'Failed to fetch price.' });
-  }
-});
-
-app.get('/api/prices', async (req, res) => {
-  try {
-    const prices = await getCryptoPrices(SUPPORTED_SYMBOLS);
-    res.json({ prices, timestamp: new Date().toISOString() });
-  } catch (error) {
-    log('error', 'Prices fetch error', error);
-    res.status(500).json({ error: 'Failed to fetch prices.' });
-  }
-});
-
-app.get('/api/convert', async (req, res) => {
-  try {
-    const { from, to, amount } = req.query;
-    if (!from || !to || !amount) {
-      return res.status(400).json({ error: 'Missing parameters: from, to, amount' });
-    }
-
-    const amountNum = parseFloat(amount);
-    if (isNaN(amountNum) || amountNum <= 0) {
-      return res.status(400).json({ error: 'Amount must be a positive number.' });
-    }
-
-    const fromUpper = from.toUpperCase();
-    const toUpper = to.toUpperCase();
-
-    if (fromUpper === 'USD' && toUpper === 'USD') {
-      return res.json({ from: 'USD', to: 'USD', amount: amountNum, result: amountNum, rate: 1, timestamp: new Date().toISOString() });
-    }
-
-    const symbolsNeeded = [];
-    if (fromUpper !== 'USD') symbolsNeeded.push(fromUpper);
-    if (toUpper !== 'USD') symbolsNeeded.push(toUpper);
-
-    for (const sym of symbolsNeeded) {
-      if (!SUPPORTED_SYMBOLS.includes(sym)) {
-        return res.status(400).json({ error: `Unsupported symbol: ${sym}` });
-      }
-    }
-
-    const prices = await getCryptoPrices(symbolsNeeded);
-
-    if (fromUpper === 'USD') {
-      const price = prices[toUpper];
-      if (!price) return res.status(404).json({ error: `Price for ${toUpper} not available.` });
-      const result = amountNum / price;
-      return res.json({
-        from: 'USD',
-        to: toUpper,
-        amount: amountNum,
-        result: result,
-        rate: price,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    if (toUpper === 'USD') {
-      const price = prices[fromUpper];
-      if (!price) return res.status(404).json({ error: `Price for ${fromUpper} not available.` });
-      const result = amountNum * price;
-      return res.json({
-        from: fromUpper,
-        to: 'USD',
-        amount: amountNum,
-        result: result,
-        rate: price,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    const fromPrice = prices[fromUpper];
-    const toPrice = prices[toUpper];
-    if (!fromPrice || !toPrice) {
-      return res.status(404).json({ error: 'Price for one of the symbols not available.' });
-    }
-    const usdValue = amountNum * fromPrice;
-    const result = usdValue / toPrice;
-    const rate = fromPrice / toPrice;
-    return res.json({
-      from: fromUpper,
-      to: toUpper,
-      amount: amountNum,
-      result: result,
-      rate: rate,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    log('error', 'Conversion error', error);
-    res.status(500).json({ error: 'Conversion failed.' });
-  }
-});
-
-// ================================================================
 // EMAIL UTILITY
 // ================================================================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
@@ -783,6 +714,9 @@ transporter.verify = function (callback) {
   return Promise.resolve(true);
 };
 
+// ================================================================
+// EMAIL FUNCTIONS
+// ================================================================
 const sendVerificationEmail = async (email, code) => {
   await transporter.sendMail({
     from: process.env.EMAIL_USER,
@@ -1956,11 +1890,6 @@ app.post('/api/admin/notify', authMiddleware, adminMiddleware, async (req, res) 
     const users = await db.allAsync('SELECT id FROM users');
     const now = Math.floor(Date.now() / 1000);
 
-    const insertStmt = await db.runAsync(`
-      INSERT INTO notifications (userId, title, message, type, createdAt)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-
     for (const user of users) {
       await db.runAsync(`
         INSERT INTO notifications (userId, title, message, type, createdAt)
@@ -3034,19 +2963,32 @@ app.use((err, req, res, next) => {
 });
 
 // ================================================================
-// START SERVER
+// START SERVER (after database init)
 // ================================================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 API available at http://localhost:${PORT}/api`);
-  console.log(`🎁 New users get $50 signup bonus!`);
-  console.log(`💰 Plan prices: Starter $100, Basic $500, Pro $1500, Elite $3500, Enterprise $7500, Titan $15000`);
-  console.log(`🪙 Supported crypto: ${SUPPORTED_SYMBOLS.join(', ')}`);
-  console.log(`📊 Price & conversion endpoints available at /api/prices and /api/convert`);
-  console.log(`🛟 Support tickets endpoint: /api/user/support`);
-  console.log(`🔄 Portfolio refresh endpoint: /api/user/refresh-portfolio (respects daily limits)`);
-});
+
+// First, initialize the database
+initDatabase()
+  .then(() => {
+    console.log('✅ Database ready – starting server...');
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`📡 API available at http://localhost:${PORT}/api`);
+      console.log(`🎁 New users get $50 signup bonus!`);
+      console.log(`💰 Plan prices: Starter $100, Basic $500, Pro $1500, Elite $3500, Enterprise $7500, Titan $15000`);
+      console.log(`🪙 Supported crypto: ${SUPPORTED_SYMBOLS.join(', ')}`);
+      console.log(`📊 Price & conversion endpoints available at /api/prices and /api/convert`);
+      console.log(`🛟 Support tickets endpoint: /api/user/support`);
+      console.log(`🔄 Portfolio refresh endpoint: /api/user/refresh-portfolio (respects daily limits)`);
+    });
+  })
+  .catch((err) => {
+    console.error('❌ Database initialization failed, but server will still try to start:', err);
+    // Still start the server even if DB init fails (for debugging)
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT} (but DB may have errors)`);
+    });
+  });
 
 process.on('unhandledRejection', (err) => {
   console.error('UNHANDLED REJECTION:', err);
