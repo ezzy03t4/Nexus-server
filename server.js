@@ -1097,11 +1097,27 @@ app.post('/api/auth/verify', async (req, res) => {
 
     const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+
     const user = rowToUser(userRes.rows[0]);
 
+    // Debug logs
+    console.log('🔍 Verification attempt for:', email);
+    console.log('📝 Stored code:', user.verificationCode);
+    console.log('📝 Submitted code:', code.trim());
+
     if (user.verified) return res.status(400).json({ error: 'Email already verified.' });
-    if (user.verificationCode !== code) return res.status(400).json({ error: 'Invalid code.' });
-    if (user.verificationCodeExpires < new Date()) {
+
+    // Trim both codes to avoid whitespace issues
+    const storedCode = user.verificationCode ? user.verificationCode.trim() : null;
+    const submittedCode = code.trim();
+
+    if (storedCode !== submittedCode) {
+      return res.status(400).json({ error: 'Invalid code.' });
+    }
+
+    // Check expiration (compare epoch seconds directly)
+    const nowEpoch = Math.floor(Date.now() / 1000);
+    if (user.verificationCodeExpires && user.verificationCodeExpires < nowEpoch) {
       return res.status(400).json({ error: 'Code expired. Request a new one.' });
     }
 
@@ -1137,6 +1153,7 @@ app.post('/api/auth/verify', async (req, res) => {
       },
     });
   } catch (error) {
+    console.error('🔥 Verification error:', error);
     log('error', 'Verification error', error);
     res.status(500).json({ error: 'Server error during verification.' });
   }
