@@ -8,7 +8,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');              // PostgreSQL driver
 const { promisify } = require('util');
 const axios = require('axios');
 const multer = require('multer');
@@ -99,37 +99,77 @@ setInterval(() => {
 app.use(rateLimiter);
 
 // ================================================================
-// SQLITE DATABASE (with full schema and migrations) - using sqlite3
+// POSTGRESQL DATABASE (with full schema and migrations)
 // ================================================================
-const db = new sqlite3.Database(process.env.DATABASE_PATH || 'database.sqlite');
-db.run('PRAGMA foreign_keys = ON');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false
+});
 
-// After db initialization
-db.getAsync = promisify(db.get).bind(db);
-db.allAsync = promisify(db.all).bind(db);
+// Helper to get current Unix timestamp (seconds)
+const nowUnix = () => Math.floor(Date.now() / 1000);
 
-// Custom runAsync that returns { lastInsertRowid, changes }
-db.runAsync = function(sql, ...params) {
-  return new Promise((resolve, reject) => {
-    this.run(sql, params, function(err) {
-      if (err) reject(err);
-      else resolve({ lastInsertRowid: this.lastID, changes: this.changes });
-    });
-  });
+// Wrapper for pool.query that returns rows
+const query = async (text, params) => {
+  const res = await pool.query(text, params);
+  return res;
 };
 
-db.execAsync = promisify(db.exec).bind(db);
+// db object mimicking the old sqlite3 interface
+const db = {
+  // For SELECT expecting a single row
+  getAsync: async (text, ...params) => {
+    const res = await pool.query(text, params);
+    return res.rows[0] || null;
+  },
+  // For SELECT expecting multiple rows
+  allAsync: async (text, ...params) => {
+    const res = await pool.query(text, params);
+    return res.rows;
+  },
+  // For INSERT/UPDATE/DELETE; returns { lastInsertRowid, changes } for compatibility
+  runAsync: async (text, ...params) => {
+    // For INSERT we often need the generated id; we'll add RETURNING id automatically if not present.
+    let queryText = text;
+    let returning = false;
+    if (queryText.trim().toUpperCase().startsWith('INSERT')) {
+      // If query doesn't already have RETURNING, add it
+      if (!queryText.toUpperCase().includes('RETURNING')) {
+        queryText += ' RETURNING id';
+        returning = true;
+      }
+    }
+    const res = await pool.query(queryText, params);
+    let lastInsertRowid = null;
+    if (returning && res.rows && res.rows.length > 0) {
+      lastInsertRowid = res.rows[0].id;
+    } else if (res.rows && res.rows.length > 0 && res.rows[0].id !== undefined) {
+      lastInsertRowid = res.rows[0].id;
+    }
+    // rowCount is the number of rows affected
+    return { lastInsertRowid, changes: res.rowCount };
+  },
+  // For executing multiple statements (migrations)
+  execAsync: async (sql) => {
+    // PostgreSQL doesn't support multiple statements in one query by default.
+    // We'll split by semicolon and execute each non-empty statement.
+    const statements = sql.split(';').filter(stmt => stmt.trim().length > 0);
+    for (const stmt of statements) {
+      await pool.query(stmt);
+    }
+  }
+};
 
 // ================================================================
 // INITIALIZE DATABASE (migrations) — fully async
 // ================================================================
 async function initDatabase() {
-  console.log('🔄 Running database schema migrations...');
+  console.log('🔄 Running database schema migrations (PostgreSQL)...');
 
   // Users table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password TEXT NOT NULL,
@@ -143,8 +183,8 @@ async function initDatabase() {
       verified INTEGER DEFAULT 0,
       verificationCode TEXT DEFAULT NULL,
       verificationCodeExpires INTEGER DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now'))
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT,
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT
     )
   `);
   console.log('✅ Users table ready');
@@ -152,8 +192,8 @@ async function initDatabase() {
   // Transactions table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS transactions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
       amount REAL NOT NULL,
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
@@ -161,10 +201,14 @@ async function initDatabase() {
       description TEXT DEFAULT '',
       reference TEXT DEFAULT NULL,
       proof TEXT DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT,
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT,
       completedAt INTEGER DEFAULT NULL,
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      currency TEXT DEFAULT 'USD',
+      originalAmount REAL DEFAULT 0,
+      exchangeRate REAL DEFAULT 1,
+      feePercent REAL DEFAULT 0,
+      feeAmount REAL DEFAULT 0
     )
   `);
   console.log('✅ Transactions table ready');
@@ -172,14 +216,13 @@ async function initDatabase() {
   // Notifications table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS notifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       title TEXT NOT NULL,
       message TEXT NOT NULL,
       type TEXT DEFAULT 'info',
       isRead INTEGER DEFAULT 0,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT
     )
   `);
   console.log('✅ Notifications table ready');
@@ -187,12 +230,11 @@ async function initDatabase() {
   // Sessions table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       token TEXT NOT NULL UNIQUE,
       expiresAt INTEGER NOT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT
     )
   `);
   console.log('✅ Sessions table ready');
@@ -200,13 +242,12 @@ async function initDatabase() {
   // Daily usage table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS daily_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       date TEXT NOT NULL,
       action TEXT NOT NULL,
       count INTEGER DEFAULT 0,
-      UNIQUE(userId, date, action),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      UNIQUE(userId, date, action)
     )
   `);
   console.log('✅ Daily usage table ready');
@@ -214,14 +255,13 @@ async function initDatabase() {
   // Holdings table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS holdings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       symbol TEXT NOT NULL,
       amount REAL NOT NULL,
       averagePrice REAL NOT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT,
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT,
       UNIQUE(userId, symbol)
     )
   `);
@@ -230,8 +270,8 @@ async function initDatabase() {
   // Support tickets table
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS support_tickets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       subject TEXT NOT NULL,
       category TEXT NOT NULL,
       priority TEXT NOT NULL,
@@ -239,27 +279,29 @@ async function initDatabase() {
       attachment TEXT DEFAULT NULL,
       status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
       adminReply TEXT DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT,
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INT
     )
   `);
   console.log('✅ Support tickets table ready');
 
   // ---- Migrations: ensure all columns exist ----
-  // Users
-  const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
-  const existingUserCols = userTableInfo.map(c => c.name);
+  // Users columns
+  const userCols = await db.allAsync(`
+    SELECT column_name FROM information_schema.columns 
+    WHERE table_name = 'users'
+  `);
+  const existingUserCols = userCols.map(c => c.column_name);
   const userColumnsToAdd = [
-    { name: 'profilePicture', type: 'TEXT DEFAULT NULL' },
+    { name: 'profilePicture', type: 'TEXT' },
     { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'selectedPlan', type: 'TEXT DEFAULT NULL' },
+    { name: 'selectedPlan', type: 'TEXT' },
     { name: 'balance', type: 'REAL DEFAULT 0' },
     { name: 'isAdmin', type: 'INTEGER DEFAULT 0' },
     { name: 'blocked', type: 'INTEGER DEFAULT 0' },
     { name: 'verified', type: 'INTEGER DEFAULT 0' },
-    { name: 'verificationCode', type: 'TEXT DEFAULT NULL' },
-    { name: 'verificationCodeExpires', type: 'INTEGER DEFAULT NULL' }
+    { name: 'verificationCode', type: 'TEXT' },
+    { name: 'verificationCodeExpires', type: 'INTEGER' }
   ];
   for (const col of userColumnsToAdd) {
     if (!existingUserCols.includes(col.name)) {
@@ -268,18 +310,21 @@ async function initDatabase() {
       console.log(`✅ ${col.name} column added.`);
     }
   }
-  await db.execAsync('UPDATE users SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+  await db.execAsync(`UPDATE users SET updatedAt = EXTRACT(EPOCH FROM NOW())::INT WHERE updatedAt IS NULL OR updatedAt = 0`);
 
-  // Transactions
-  const txTableInfo = await db.allAsync("PRAGMA table_info(transactions)");
-  const existingTxCols = txTableInfo.map(c => c.name);
+  // Transactions columns
+  const txCols = await db.allAsync(`
+    SELECT column_name FROM information_schema.columns 
+    WHERE table_name = 'transactions'
+  `);
+  const existingTxCols = txCols.map(c => c.column_name);
   const txColumnsToAdd = [
-    { name: 'proof', type: 'TEXT DEFAULT NULL' },
-    { name: 'description', type: 'TEXT DEFAULT ""' },
-    { name: 'completedAt', type: 'INTEGER DEFAULT NULL' },
-    { name: 'method', type: 'TEXT DEFAULT NULL' },
+    { name: 'proof', type: 'TEXT' },
+    { name: 'description', type: 'TEXT DEFAULT \'\'' },
+    { name: 'completedAt', type: 'INTEGER' },
+    { name: 'method', type: 'TEXT' },
     { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'currency', type: 'TEXT DEFAULT "USD"' },
+    { name: 'currency', type: 'TEXT DEFAULT \'USD\'' },
     { name: 'originalAmount', type: 'REAL DEFAULT 0' },
     { name: 'exchangeRate', type: 'REAL DEFAULT 1' },
     { name: 'feePercent', type: 'REAL DEFAULT 0' },
@@ -292,52 +337,17 @@ async function initDatabase() {
       console.log(`✅ ${col.name} column added.`);
     }
   }
-  await db.execAsync('UPDATE transactions SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+  await db.execAsync(`UPDATE transactions SET updatedAt = EXTRACT(EPOCH FROM NOW())::INT WHERE updatedAt IS NULL OR updatedAt = 0`);
 
-  // Fix transactions CHECK constraint to include 'plan_purchase'
-  const txCreateSql = await db.getAsync("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'");
-  if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
-    console.log('🔄 Recreating transactions table to add plan_purchase...');
-    await db.execAsync('BEGIN TRANSACTION');
-    await db.execAsync(`
-      CREATE TABLE transactions_new (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        userId INTEGER NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
-        amount REAL NOT NULL,
-        status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
-        method TEXT DEFAULT NULL,
-        description TEXT DEFAULT '',
-        reference TEXT DEFAULT NULL,
-        proof TEXT DEFAULT NULL,
-        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-        updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-        completedAt INTEGER DEFAULT NULL,
-        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-      )
-    `);
-    await db.execAsync(`
-      INSERT INTO transactions_new (
-        id, userId, type, amount, status, method, description,
-        reference, proof, createdAt, updatedAt, completedAt
-      )
-      SELECT
-        id, userId, type, amount, status, method, description,
-        reference, proof, createdAt, updatedAt, completedAt
-      FROM transactions
-    `);
-    await db.execAsync('DROP TABLE transactions');
-    await db.execAsync('ALTER TABLE transactions_new RENAME TO transactions');
-    await db.execAsync('COMMIT');
-    console.log('✅ transactions table recreated with updated CHECK constraint.');
-  }
-
-  // Support tickets
-  const supportTableInfo = await db.allAsync("PRAGMA table_info(support_tickets)");
-  const existingSupportCols = supportTableInfo.map(c => c.name);
+  // Support tickets columns
+  const supportCols = await db.allAsync(`
+    SELECT column_name FROM information_schema.columns 
+    WHERE table_name = 'support_tickets'
+  `);
+  const existingSupportCols = supportCols.map(c => c.column_name);
   const supportColumnsToAdd = [
-    { name: 'attachment', type: 'TEXT DEFAULT NULL' },
-    { name: 'adminReply', type: 'TEXT DEFAULT NULL' },
+    { name: 'attachment', type: 'TEXT' },
+    { name: 'adminReply', type: 'TEXT' },
     { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
   ];
   for (const col of supportColumnsToAdd) {
@@ -347,7 +357,7 @@ async function initDatabase() {
       console.log(`✅ ${col.name} column added.`);
     }
   }
-  await db.execAsync('UPDATE support_tickets SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+  await db.execAsync(`UPDATE support_tickets SET updatedAt = EXTRACT(EPOCH FROM NOW())::INT WHERE updatedAt IS NULL OR updatedAt = 0`);
 
   console.log('✅ Database schema and migrations applied.');
 }
@@ -364,16 +374,16 @@ const rowToUser = (row) => {
     password: row.password,
     country: row.country,
     phone: row.phone || '',
-    selectedPlan: row.selectedPlan || null,
+    selectedPlan: row.selectedplan || null,
     balance: row.balance || 0,
-    profilePicture: row.profilePicture || null,
-    isAdmin: row.isAdmin === 1,
+    profilePicture: row.profilepicture || null,
+    isAdmin: row.isadmin === 1,
     blocked: row.blocked === 1,
     verified: row.verified === 1,
-    verificationCode: row.verificationCode || null,
-    verificationCodeExpires: row.verificationCodeExpires ? new Date(row.verificationCodeExpires * 1000) : null,
-    createdAt: new Date(row.createdAt * 1000),
-    updatedAt: new Date(row.updatedAt * 1000),
+    verificationCode: row.verificationcode || null,
+    verificationCodeExpires: row.verificationcodeexpires ? new Date(row.verificationcodeexpires * 1000) : null,
+    createdAt: new Date(row.createdat * 1000),
+    updatedAt: new Date(row.updatedat * 1000),
   };
 };
 
@@ -381,7 +391,7 @@ const rowToTransaction = (row) => {
   if (!row) return null;
   return {
     id: row.id,
-    userId: row.userId,
+    userId: row.userid,
     type: row.type,
     amount: row.amount,
     status: row.status,
@@ -389,9 +399,9 @@ const rowToTransaction = (row) => {
     description: row.description || '',
     reference: row.reference || null,
     proof: row.proof || null,
-    createdAt: new Date(row.createdAt * 1000),
-    updatedAt: new Date(row.updatedAt * 1000),
-    completedAt: row.completedAt ? new Date(row.completedAt * 1000) : null,
+    createdAt: new Date(row.createdat * 1000),
+    updatedAt: new Date(row.updatedat * 1000),
+    completedAt: row.completedat ? new Date(row.completedat * 1000) : null,
   };
 };
 
@@ -448,15 +458,18 @@ function getTodayDate() {
 }
 
 async function getDailyUsage(userId, action, date) {
-  const row = await db.getAsync('SELECT count FROM daily_usage WHERE userId = ? AND date = ? AND action = ?', userId, date, action);
+  const row = await db.getAsync(
+    'SELECT count FROM daily_usage WHERE userId = $1 AND date = $2 AND action = $3',
+    userId, date, action
+  );
   return row ? row.count : 0;
 }
 
 async function incrementDailyUsage(userId, action, date) {
   await db.runAsync(`
     INSERT INTO daily_usage (userId, date, action, count)
-    VALUES (?, ?, ?, 1)
-    ON CONFLICT(userId, date, action) DO UPDATE SET count = count + 1
+    VALUES ($1, $2, $3, 1)
+    ON CONFLICT (userId, date, action) DO UPDATE SET count = daily_usage.count + 1
   `, userId, date, action);
 }
 
@@ -631,14 +644,14 @@ async function getCryptoPrices(symbols) {
 async function seedAdmin() {
   const adminEmail = 'admin@nexus.com';
   const adminPassword = 'Admin123!';
-  const existing = await db.getAsync('SELECT id FROM users WHERE email = ?', adminEmail);
+  const existing = await db.getAsync('SELECT id FROM users WHERE email = $1', adminEmail);
   if (!existing) {
     const salt = await bcrypt.genSalt(10);
     const hashed = await bcrypt.hash(adminPassword, salt);
     await db.runAsync(`
-      INSERT INTO users (name, email, password, country, isAdmin, verified, balance)
-      VALUES ('Admin', ?, ?, 'Global', 1, 1, 0)
-    `, adminEmail, hashed);
+      INSERT INTO users (name, email, password, country, isAdmin, verified, balance, createdAt, updatedAt)
+      VALUES ('Admin', $1, $2, 'Global', 1, 1, 0, $3, $3)
+    `, adminEmail, hashed, nowUnix());
     console.log('✅ Default admin created: admin@nexus.com / Admin123!');
   }
 }
@@ -1127,8 +1140,8 @@ const authMiddleware = async (req, res, next) => {
 
 const adminMiddleware = async (req, res, next) => {
   try {
-    const userRow = await db.getAsync('SELECT isAdmin FROM users WHERE id = ?', req.user.id);
-    if (!userRow || !userRow.isAdmin) return res.status(403).json({ error: 'Admin access required.' });
+    const userRow = await db.getAsync('SELECT isAdmin FROM users WHERE id = $1', req.user.id);
+    if (!userRow || !userRow.isadmin) return res.status(403).json({ error: 'Admin access required.' });
     next();
   } catch (error) {
     log('error', 'Admin middleware error', error);
@@ -1149,11 +1162,11 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const existing = await db.getAsync('SELECT id FROM users WHERE email = ?', email);
+    const existing = await db.getAsync('SELECT id FROM users WHERE email = $1', email);
     if (existing) return res.status(400).json({ error: 'User already exists.' });
 
     const verificationCode = generateVerificationCode();
-    const codeExpires = Math.floor(Date.now() / 1000) + 10 * 60;
+    const codeExpires = nowUnix() + 10 * 60;
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
@@ -1161,23 +1174,21 @@ app.post('/api/auth/register', async (req, res) => {
     const info = await db.runAsync(`
       INSERT INTO users (
         name, email, password, country, phone,
-        verificationCode, verificationCodeExpires, verified, balance, updatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 50, strftime('%s', 'now'))
-    `, name, email, hashedPassword, country, phone || '', verificationCode, codeExpires);
+        verificationCode, verificationCodeExpires, verified, balance, createdAt, updatedAt
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 50, $8, $8)
+    `, name, email, hashedPassword, country, phone || '', verificationCode, codeExpires, nowUnix());
     const userId = info.lastInsertRowid;
 
     await db.runAsync(`
-      INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?)
-    `, userId, generateReference());
+      INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+      VALUES ($1, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', $2, $3, $3)
+    `, userId, generateReference(), nowUnix());
 
     // --- Email sending (now wrapped) ---
     try {
       await sendVerificationEmail(email, verificationCode);
     } catch (emailError) {
-      // Log the error but do NOT fail the registration
       console.error('⚠️ Email could not be sent:', emailError.message);
-      // Optionally, you can store the error in a log table, but we just log it.
     }
 
     log('info', `New user registered: ${email} (ID: ${userId})`);
@@ -1200,7 +1211,7 @@ app.post('/api/auth/verify', async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: 'Email and code are required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = $1', email);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1211,11 +1222,11 @@ app.post('/api/auth/verify', async (req, res) => {
     }
 
     await db.runAsync(`
-      UPDATE users SET verified = 1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, user.id);
+      UPDATE users SET verified = 1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = $1
+      WHERE id = $2
+    `, nowUnix(), user.id);
 
-    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = ?', user.id);
+    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = $1', user.id);
     const updatedUser = rowToUser(updatedRow);
     const token = jwt.sign(
       { id: updatedUser.id, email: updatedUser.email },
@@ -1252,18 +1263,18 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = $1', email);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
     if (user.verified) return res.status(400).json({ error: 'Email already verified.' });
 
     const verificationCode = generateVerificationCode();
-    const codeExpires = Math.floor(Date.now() / 1000) + 10 * 60;
+    const codeExpires = nowUnix() + 10 * 60;
     await db.runAsync(`
-      UPDATE users SET verificationCode = ?, verificationCodeExpires = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, verificationCode, codeExpires, user.id);
+      UPDATE users SET verificationCode = $1, verificationCodeExpires = $2, updatedAt = $3
+      WHERE id = $4
+    `, verificationCode, codeExpires, nowUnix(), user.id);
 
     await sendVerificationEmail(email, verificationCode);
     res.json({ message: 'New verification code sent.' });
@@ -1278,7 +1289,7 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = $1', email);
     if (!userRow) return res.status(401).json({ error: 'Invalid credentials.' });
     const user = rowToUser(userRow);
 
@@ -1292,7 +1303,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Please verify your email before logging in.' });
     }
 
-    await db.runAsync(`UPDATE users SET updatedAt = strftime('%s', 'now') WHERE id = ?`, user.id);
+    await db.runAsync(`UPDATE users SET updatedAt = $1 WHERE id = $2`, nowUnix(), user.id);
 
     const token = jwt.sign(
       { id: user.id, email: user.email },
@@ -1329,18 +1340,18 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = $1', email);
     if (!userRow) {
       return res.json({ message: 'If an account exists, a reset code has been sent.' });
     }
     const user = rowToUser(userRow);
 
     const resetCode = generateResetCode();
-    const codeExpires = Math.floor(Date.now() / 1000) + 15 * 60;
+    const codeExpires = nowUnix() + 15 * 60;
     await db.runAsync(`
-      UPDATE users SET verificationCode = ?, verificationCodeExpires = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, resetCode, codeExpires, user.id);
+      UPDATE users SET verificationCode = $1, verificationCodeExpires = $2, updatedAt = $3
+      WHERE id = $4
+    `, resetCode, codeExpires, nowUnix(), user.id);
 
     await sendPasswordResetEmail(email, resetCode);
     res.json({ message: 'If an account exists, a reset code has been sent.' });
@@ -1360,7 +1371,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = $1', email);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1373,9 +1384,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
     await db.runAsync(`
-      UPDATE users SET password = ?, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, hashedPassword, user.id);
+      UPDATE users SET password = $1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = $2
+      WHERE id = $3
+    `, hashedPassword, nowUnix(), user.id);
 
     log('info', `Password reset for user: ${email} (ID: ${user.id})`);
     res.json({ message: 'Password reset successfully. Please login with your new password.' });
@@ -1391,7 +1402,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 app.get('/api/user/me', authMiddleware, async (req, res) => {
   try {
-    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE id = $1', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
     delete user.password;
@@ -1408,37 +1419,35 @@ app.put('/api/user/update', authMiddleware, async (req, res) => {
   try {
     const { name, phone, country, profilePicture } = req.body;
 
-    const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
-    const existingColumns = userTableInfo.map(c => c.name);
-
-    const columnsToEnsure = ['profilePicture', 'updatedAt', 'selectedPlan', 'balance'];
-    for (const col of columnsToEnsure) {
-      if (!existingColumns.includes(col)) {
-        console.log(`⚠️ Column ${col} missing – adding now...`);
-        await db.execAsync(`ALTER TABLE users ADD COLUMN ${col} TEXT DEFAULT NULL`);
-        console.log(`✅ Column ${col} added.`);
-      }
-    }
+    // Ensure columns exist (PostgreSQL version)
+    const colCheck = await db.allAsync(`
+      SELECT column_name FROM information_schema.columns 
+      WHERE table_name = 'users' AND column_name IN ('profilepicture', 'updatedat', 'selectedplan', 'balance')
+    `);
+    const existing = colCheck.map(c => c.column_name);
+    // We'll just assume they exist from migrations
 
     const updates = [];
     const values = [];
+    let paramIdx = 1;
 
-    if (name !== undefined) { updates.push('name = ?'); values.push(name); }
-    if (phone !== undefined) { updates.push('phone = ?'); values.push(phone); }
-    if (country !== undefined) { updates.push('country = ?'); values.push(country); }
-    if (profilePicture !== undefined) { updates.push('profilePicture = ?'); values.push(profilePicture); }
+    if (name !== undefined) { updates.push(`name = $${paramIdx++}`); values.push(name); }
+    if (phone !== undefined) { updates.push(`phone = $${paramIdx++}`); values.push(phone); }
+    if (country !== undefined) { updates.push(`country = $${paramIdx++}`); values.push(country); }
+    if (profilePicture !== undefined) { updates.push(`profilePicture = $${paramIdx++}`); values.push(profilePicture); }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No fields to update.' });
     }
 
-    updates.push(`updatedAt = strftime('%s', 'now')`);
+    updates.push(`updatedAt = $${paramIdx++}`);
+    values.push(nowUnix());
     values.push(req.user.id);
 
-    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIdx}`;
     await db.runAsync(query, ...values);
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE id = $1', req.user.id);
     const user = rowToUser(userRow);
     delete user.password;
     delete user.verificationCode;
@@ -1463,7 +1472,7 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters.' });
     }
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE id = $1', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1474,8 +1483,8 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
     await db.runAsync(`
-      UPDATE users SET password = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, hashedPassword, user.id);
+      UPDATE users SET password = $1, updatedAt = $2 WHERE id = $3
+    `, hashedPassword, nowUnix(), user.id);
 
     log('info', `Password changed for user ${user.email} (ID: ${user.id})`);
     res.json({ message: 'Password changed successfully.' });
@@ -1488,28 +1497,29 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
 app.get('/api/user/transactions', authMiddleware, async (req, res) => {
   try {
     const { limit = 50, offset = 0, type } = req.query;
-    let query = 'SELECT * FROM transactions WHERE userId = ?';
+    let query = 'SELECT * FROM transactions WHERE userId = $1';
     const params = [req.user.id];
+    let paramIdx = 2;
 
     if (type) {
-      query += ' AND type = ?';
+      query += ` AND type = $${paramIdx++}`;
       params.push(type);
     }
 
-    query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
+    query += ` ORDER BY createdAt DESC LIMIT $${paramIdx++} OFFSET $${paramIdx++}`;
     params.push(parseInt(limit), parseInt(offset));
 
     const rows = await db.allAsync(query, ...params);
     const transactions = rows.map(rowToTransaction);
 
-    let countQuery = 'SELECT COUNT(*) as total FROM transactions WHERE userId = ?';
+    let countQuery = 'SELECT COUNT(*) as total FROM transactions WHERE userId = $1';
     const countParams = [req.user.id];
     if (type) {
-      countQuery += ' AND type = ?';
+      countQuery += ' AND type = $2';
       countParams.push(type);
     }
     const totalRow = await db.getAsync(countQuery, ...countParams);
-    const total = totalRow ? totalRow.total : 0;
+    const total = totalRow ? parseInt(totalRow.total) : 0;
 
     res.json({ transactions, pagination: { total, limit: parseInt(limit), offset: parseInt(offset) } });
   } catch (error) {
@@ -1520,7 +1530,7 @@ app.get('/api/user/transactions', authMiddleware, async (req, res) => {
 
 app.get('/api/user/balance', authMiddleware, async (req, res) => {
   try {
-    const row = await db.getAsync('SELECT balance FROM users WHERE id = ?', req.user.id);
+    const row = await db.getAsync('SELECT balance FROM users WHERE id = $1', req.user.id);
     if (!row) return res.status(404).json({ error: 'User not found.' });
     res.json({ balance: row.balance || 0 });
   } catch (error) {
@@ -1574,15 +1584,15 @@ app.post('/api/user/deposit', authMiddleware, async (req, res) => {
         const info = await db.runAsync(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference, proof,
-                currency, originalAmount, exchangeRate, feePercent, feeAmount
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, req.user.id, 'deposit', finalUsdAmount, method || 'bank', description, reference, proof || null,
-            originalCurrency, originalAmount, exchangeRate, feePercent, feeAmount);
+                currency, originalAmount, exchangeRate, feePercent, feeAmount, createdAt, updatedAt
+            ) VALUES ($1, 'deposit', $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+        `, req.user.id, finalUsdAmount, method || 'bank', description, reference, proof || null,
+            originalCurrency, originalAmount, exchangeRate, feePercent, feeAmount, nowUnix());
         const transactionId = info.lastInsertRowid;
-        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
         const transaction = rowToTransaction(transactionRow);
 
-        const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
+        const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = $1', req.user.id);
         if (userRow) {
             await sendDepositNotificationEmail(userRow.email, userRow.name, transaction, proof || null);
         }
@@ -1645,7 +1655,7 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
             });
         }
 
-        const userRow = await db.getAsync('SELECT email, name FROM users WHERE id = ?', user.id);
+        const userRow = await db.getAsync('SELECT email, name FROM users WHERE id = $1', user.id);
         if (!userRow) {
             return res.status(404).json({ error: 'User not found.' });
         }
@@ -1654,9 +1664,9 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         log('info', `Flutterwave: Creating payment for reference: ${reference}, amount: ${depositAmount} ${currency}`);
 
         const info = await db.runAsync(`
-            INSERT INTO transactions (userId, type, amount, status, method, description, reference, proof)
-            VALUES (?, 'deposit', ?, 'pending', 'card', 'Flutterwave deposit', ?, ?)
-        `, user.id, depositAmount, reference, 'pending');
+            INSERT INTO transactions (userId, type, amount, status, method, description, reference, proof, createdAt, updatedAt)
+            VALUES ($1, 'deposit', $2, 'pending', 'card', 'Flutterwave deposit', $3, 'pending', $4, $4)
+        `, user.id, depositAmount, reference, nowUnix());
         const transactionId = info.lastInsertRowid;
 
         const redirectUrl = `http://localhost:5000/api/deposit/verify/${reference}`;
@@ -1697,7 +1707,7 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         if (response.data.status === 'success') {
             const paymentLink = response.data.data.link;
             log('info', `Flutterwave: Payment link created: ${paymentLink}`);
-            await db.runAsync(`UPDATE transactions SET proof = ? WHERE id = ?`, paymentLink, transactionId);
+            await db.runAsync(`UPDATE transactions SET proof = $1 WHERE id = $2`, paymentLink, transactionId);
 
             res.json({
                 success: true,
@@ -1735,7 +1745,7 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
         const reference = req.params.reference;
         const userId = req.user.id;
 
-        const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = ? AND userId = ?', reference, userId);
+        const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = $1 AND userId = $2', reference, userId);
 
         if (!tx) {
             return res.status(404).json({ status: 'not_found', error: 'Transaction not found.' });
@@ -1755,11 +1765,11 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
             );
             const data = response.data;
             if (data.status === 'success' && data.data.status === 'successful') {
-                await db.runAsync(`UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
-                await db.runAsync(`UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, tx.amount, userId);
+                await db.runAsync(`UPDATE transactions SET status = 'completed', completedAt = $1 WHERE id = $2`, nowUnix(), tx.id);
+                await db.runAsync(`UPDATE users SET balance = balance + $1, updatedAt = $2 WHERE id = $3`, tx.amount, nowUnix(), userId);
                 return res.json({ status: 'completed' });
             } else if (data.data.status === 'failed') {
-                await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
+                await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = $1 WHERE id = $2`, nowUnix(), tx.id);
                 return res.json({ status: 'failed' });
             } else {
                 return res.json({ status: 'pending' });
@@ -1768,7 +1778,7 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
             if (apiError.response && apiError.response.status === 400) {
                 const errorData = apiError.response.data;
                 if (errorData && errorData.message && errorData.message.includes('No transaction was found')) {
-                    const createdAt = tx.createdAt;
+                    const createdAt = tx.createdat;
                     const now = Math.floor(Date.now() / 1000);
                     const age = now - createdAt;
                     if (age < 120) {
@@ -1776,7 +1786,7 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
                         return res.json({ status: 'pending' });
                     } else {
                         log('info', `Transaction ${reference} marked as failed (not found on Flutterwave after ${age}s)`);
-                        await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
+                        await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = $1 WHERE id = $2`, nowUnix(), tx.id);
                         return res.json({ status: 'failed', message: 'Transaction not found on Flutterwave' });
                     }
                 }
@@ -1803,31 +1813,31 @@ app.post('/api/webhooks/flutterwave', express.json(), async (req, res) => {
             const txRef = event.data.tx_ref;
             const status = event.data.status;
 
-            const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = ?', txRef);
+            const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = $1', txRef);
             if (!tx || tx.status === 'completed') {
                 return res.status(200).send('OK');
             }
 
             if (status === 'successful') {
                 await db.runAsync(`
-                    UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now')
-                    WHERE id = ?
-                `, tx.id);
+                    UPDATE transactions SET status = 'completed', completedAt = $1
+                    WHERE id = $2
+                `, nowUnix(), tx.id);
 
                 await db.runAsync(`
-                    UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now')
-                    WHERE id = ?
-                `, tx.amount, tx.userId);
+                    UPDATE users SET balance = balance + $1, updatedAt = $2
+                    WHERE id = $3
+                `, tx.amount, nowUnix(), tx.userid);
 
-                log('info', `Webhook: Deposit ${tx.amount} completed for user ${tx.userId}`);
+                log('info', `Webhook: Deposit ${tx.amount} completed for user ${tx.userid}`);
 
                 try {
-                    const user = await db.getAsync('SELECT name, email FROM users WHERE id = ?', tx.userId);
+                    const user = await db.getAsync('SELECT name, email FROM users WHERE id = $1', tx.userid);
                     if (user) {
                         await sendDepositNotificationEmail(user.email, user.name, tx, null);
                         log('info', `Admin email sent for card deposit ${txRef} (user: ${user.email})`);
                     } else {
-                        log('warn', `User not found for card deposit ${txRef} (userId: ${tx.userId})`);
+                        log('warn', `User not found for card deposit ${txRef} (userId: ${tx.userid})`);
                     }
                 } catch (emailError) {
                     log('error', 'Failed to send admin email for card deposit', { error: emailError.message });
@@ -1835,9 +1845,9 @@ app.post('/api/webhooks/flutterwave', express.json(), async (req, res) => {
 
             } else if (status === 'failed') {
                 await db.runAsync(`
-                    UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now')
-                    WHERE id = ?
-                `, tx.id);
+                    UPDATE transactions SET status = 'failed', completedAt = $1
+                    WHERE id = $2
+                `, nowUnix(), tx.id);
             }
         }
 
@@ -1867,7 +1877,7 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
       return res.status(400).json({ error: 'Proof image is required (as file or base64).' });
     }
 
-    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ? AND userId = ?', transactionId, req.user.id);
+    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = $1 AND userId = $2', transactionId, req.user.id);
     if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
     if (transaction.status !== 'pending') return res.status(400).json({ error: 'Transaction already processed.' });
     if (transaction.type !== 'deposit') return res.status(400).json({ error: 'Not a deposit.' });
@@ -1881,18 +1891,18 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
     }
 
     await db.runAsync(`
-      UPDATE transactions SET proof = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, proofForDb, transactionId);
+      UPDATE transactions SET proof = $1, updatedAt = $2
+      WHERE id = $3
+    `, proofForDb, nowUnix(), transactionId);
 
-    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = $1', req.user.id);
     await sendDepositProofEmail(userRow.email, userRow.name, transaction, proofData);
 
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
-    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
     const updatedTransaction = rowToTransaction(updatedTransactionRow);
 
     log('info', `Deposit proof uploaded for transaction ${transactionId} by user ${req.user.id}`);
@@ -1975,12 +1985,12 @@ app.post('/api/admin/notify', authMiddleware, adminMiddleware, async (req, res) 
     }
 
     const users = await db.allAsync('SELECT id FROM users');
-    const now = Math.floor(Date.now() / 1000);
+    const now = nowUnix();
 
     for (const user of users) {
       await db.runAsync(`
         INSERT INTO notifications (userId, title, message, type, createdAt)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5)
       `, user.id, title, message, type, now);
     }
 
@@ -1996,7 +2006,7 @@ app.get('/api/user/notifications', authMiddleware, async (req, res) => {
   try {
     const notifications = await db.allAsync(`
       SELECT * FROM notifications
-      WHERE userId = ?
+      WHERE userId = $1
       ORDER BY createdAt DESC
       LIMIT 50
     `, req.user.id);
@@ -2016,19 +2026,19 @@ app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, async (req
       return res.status(400).json({ error: 'Invalid plan name.' });
     }
 
-    const userRow = await db.getAsync('SELECT id, name, email FROM users WHERE id = ?', userId);
+    const userRow = await db.getAsync('SELECT id, name, email FROM users WHERE id = $1', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
     await db.runAsync(`
-      UPDATE users SET selectedPlan = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, planName, userId);
+      UPDATE users SET selectedPlan = $1, updatedAt = $2
+      WHERE id = $3
+    `, planName, nowUnix(), userId);
 
     const reference = generateReference();
     await db.runAsync(`
-      INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'plan_purchase', 0, 'completed', 'Admin assigned plan: ' || ?, ?)
-    `, userId, planName, reference);
+      INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+      VALUES ($1, 'plan_purchase', 0, 'completed', 'Admin assigned plan: ' || $2, $3, $4, $4)
+    `, userId, planName, reference, nowUnix());
 
     log('info', `Admin assigned plan ${planName} to user ${userRow.email}`);
     res.json({ message: `Plan "${planName}" assigned to user.` });
@@ -2047,7 +2057,7 @@ app.put('/api/admin/deposit/:id/confirm', authMiddleware, adminMiddleware, async
       return res.status(400).json({ error: 'Status must be "completed" or "failed".' });
     }
 
-    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
     if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
     if (transaction.status !== 'pending' && transaction.status !== 'processing') {
       return res.status(400).json({ error: 'Transaction already finalized.' });
@@ -2055,21 +2065,21 @@ app.put('/api/admin/deposit/:id/confirm', authMiddleware, adminMiddleware, async
     if (transaction.type !== 'deposit') return res.status(400).json({ error: 'Not a deposit.' });
 
     await db.runAsync(`
-      UPDATE transactions SET status = ?, completedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, status, transactionId);
+      UPDATE transactions SET status = $1, completedAt = $2
+      WHERE id = $3
+    `, status, nowUnix(), transactionId);
 
     if (status === 'completed') {
       await db.runAsync(`
-        UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now')
-        WHERE id = ?
-      `, transaction.amount, transaction.userId);
+        UPDATE users SET balance = balance + $1, updatedAt = $2
+        WHERE id = $3
+      `, transaction.amount, nowUnix(), transaction.userid);
     }
 
-    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
     const updatedTransaction = rowToTransaction(updatedTransactionRow);
 
-    log('info', `Deposit ${status}: $${transaction.amount} for user ${transaction.userId}`);
+    log('info', `Deposit ${status}: $${transaction.amount} for user ${transaction.userid}`);
     res.json({ message: `Deposit ${status} successfully.`, transaction: updatedTransaction });
   } catch (error) {
     log('error', 'Confirm deposit error', error);
@@ -2090,7 +2100,7 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
         if (!address) return res.status(400).json({ error: 'Address is required.' });
 
         const withdrawAmount = parseFloat(amount);
-        const userRow = await db.getAsync('SELECT balance FROM users WHERE id = ?', req.user.id);
+        const userRow = await db.getAsync('SELECT balance FROM users WHERE id = $1', req.user.id);
         if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
         let usdAmount = withdrawAmount;
@@ -2127,15 +2137,15 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
         const info = await db.runAsync(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference,
-                currency, originalAmount, exchangeRate, feePercent, feeAmount
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
-        `, req.user.id, 'withdrawal', usdAmount, method || 'bank', description, reference,
-            targetCurrency, withdrawAmount, exchangeRate, feePercent, feeAmount);
+                currency, originalAmount, exchangeRate, feePercent, feeAmount, createdAt, updatedAt
+            ) VALUES ($1, 'withdrawal', $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+        `, req.user.id, usdAmount, method || 'bank', description, reference,
+            targetCurrency, withdrawAmount, exchangeRate, feePercent, feeAmount, nowUnix());
         const transactionId = info.lastInsertRowid;
-        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
         const transaction = rowToTransaction(transactionRow);
 
-        const userData = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
+        const userData = await db.getAsync('SELECT name, email FROM users WHERE id = $1', req.user.id);
         if (userData) {
             await sendWithdrawalNotificationEmail(userData.email, userData.name, transaction);
         }
@@ -2166,27 +2176,27 @@ app.put('/api/admin/withdraw/:id/confirm', authMiddleware, adminMiddleware, asyn
       return res.status(400).json({ error: 'Status must be "completed" or "failed".' });
     }
 
-    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
     if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
     if (transaction.status !== 'pending') return res.status(400).json({ error: 'Already processed.' });
     if (transaction.type !== 'withdrawal') return res.status(400).json({ error: 'Not a withdrawal.' });
 
     await db.runAsync(`
-      UPDATE transactions SET status = ?, completedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, status, transactionId);
+      UPDATE transactions SET status = $1, completedAt = $2
+      WHERE id = $3
+    `, status, nowUnix(), transactionId);
 
     if (status === 'completed') {
       await db.runAsync(`
-        UPDATE users SET balance = balance - ?, updatedAt = strftime('%s', 'now')
-        WHERE id = ?
-      `, transaction.amount, transaction.userId);
+        UPDATE users SET balance = balance - $1, updatedAt = $2
+        WHERE id = $3
+      `, transaction.amount, nowUnix(), transaction.userid);
     }
 
-    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
     const updatedTransaction = rowToTransaction(updatedTransactionRow);
 
-    log('info', `Withdrawal ${status}: $${transaction.amount} for user ${transaction.userId}`);
+    log('info', `Withdrawal ${status}: $${transaction.amount} for user ${transaction.userid}`);
     res.json({ message: `Withdrawal ${status} successfully.`, transaction: updatedTransaction });
   } catch (error) {
     log('error', 'Confirm withdrawal error', error);
@@ -2212,10 +2222,10 @@ app.post('/api/plans/select', authMiddleware, async (req, res) => {
     }
     const price = planConfig.price;
 
-    const userRow = await db.getAsync('SELECT id, name, email, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT id, name, email, balance, selectedPlan FROM users WHERE id = $1', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-    const currentPlan = userRow.selectedPlan;
+    const currentPlan = userRow.selectedplan;
     if (currentPlan) {
       const currentLevel = PLAN_ORDER[currentPlan];
       const newLevel = PLAN_ORDER[planName];
@@ -2245,16 +2255,16 @@ app.post('/api/plans/select', authMiddleware, async (req, res) => {
 
     const newBalance = currentBalance - price;
     await db.runAsync(`
-      UPDATE users SET selectedPlan = ?, balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, planName, newBalance, req.user.id);
+      UPDATE users SET selectedPlan = $1, balance = $2, updatedAt = $3 WHERE id = $4
+    `, planName, newBalance, nowUnix(), req.user.id);
 
     const reference = generateReference();
     await db.runAsync(`
-      INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'plan_purchase', ?, 'completed', 'Plan purchase: ' || ?, ?)
-    `, req.user.id, price, planName, reference);
+      INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+      VALUES ($1, 'plan_purchase', $2, 'completed', 'Plan purchase: ' || $3, $4, $5, $5)
+    `, req.user.id, price, planName, reference, nowUnix());
 
-    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = $1', req.user.id);
     const user = rowToUser(updatedRow);
     delete user.password;
     delete user.verificationCode;
@@ -2313,9 +2323,9 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const userRow = await db.getAsync('SELECT selectedPlan FROM users WHERE id = ?', userId);
+    const userRow = await db.getAsync('SELECT selectedPlan FROM users WHERE id = $1', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const planName = userRow.selectedPlan || 'Starter';
+    const planName = userRow.selectedplan || 'Starter';
     const planConfig = PLAN_CONFIG[planName];
     if (!planConfig) {
       return res.status(400).json({ error: 'Invalid plan.' });
@@ -2332,7 +2342,7 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
       });
     }
 
-    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', userId);
+    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = $1', userId);
     if (holdingsRows.length === 0) {
       return res.json({
         holdings: [],
@@ -2349,10 +2359,10 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
     const holdings = holdingsRows.map(h => ({
       symbol: h.symbol,
       amount: h.amount,
-      averagePrice: h.averagePrice,
+      averagePrice: h.averageprice,
       currentPrice: prices[h.symbol] || 0,
       value: (prices[h.symbol] || 0) * h.amount,
-      profitLoss: ((prices[h.symbol] || 0) - h.averagePrice) * h.amount,
+      profitLoss: ((prices[h.symbol] || 0) - h.averageprice) * h.amount,
     }));
 
     const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
@@ -2377,7 +2387,7 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
 app.get('/api/user/holdings', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', userId);
+    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = $1', userId);
     if (holdingsRows.length === 0) {
       return res.json({ holdings: [], totalValue: 0 });
     }
@@ -2388,10 +2398,10 @@ app.get('/api/user/holdings', authMiddleware, async (req, res) => {
     const holdings = holdingsRows.map(h => ({
       symbol: h.symbol,
       amount: h.amount,
-      averagePrice: h.averagePrice,
+      averagePrice: h.averageprice,
       currentPrice: prices[h.symbol] || 0,
       value: (prices[h.symbol] || 0) * h.amount,
-      profitLoss: ((prices[h.symbol] || 0) - h.averagePrice) * h.amount,
+      profitLoss: ((prices[h.symbol] || 0) - h.averageprice) * h.amount,
     }));
 
     const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
@@ -2414,13 +2424,13 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Unsupported crypto symbol.' });
     }
 
-    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = $1', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    if (!userRow.selectedPlan) {
+    if (!userRow.selectedplan) {
       return res.status(400).json({ error: 'You must purchase a plan before trading.' });
     }
 
-    const planConfig = PLAN_CONFIG[userRow.selectedPlan];
+    const planConfig = PLAN_CONFIG[userRow.selectedplan];
     if (!planConfig) {
       return res.status(400).json({ error: 'Invalid plan. Please contact support.' });
     }
@@ -2432,7 +2442,7 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
 
     if (amountUSD > planConfig.maxTrade) {
       return res.status(400).json({
-        error: `Your current plan (${userRow.selectedPlan}) allows a maximum trade of $${planConfig.maxTrade}. Please upgrade to trade larger amounts.`
+        error: `Your current plan (${userRow.selectedplan}) allows a maximum trade of $${planConfig.maxTrade}. Please upgrade to trade larger amounts.`
       });
     }
 
@@ -2449,27 +2459,27 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
 
     const newBalance = userRow.balance - amountUSD;
 
-    await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, newBalance, req.user.id);
+    await db.runAsync(`UPDATE users SET balance = $1, updatedAt = $2 WHERE id = $3`, newBalance, nowUnix(), req.user.id);
     console.log(`[buy] User ${req.user.id} balance updated to ${newBalance}`);
 
-    const existing = await db.getAsync('SELECT * FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbol);
+    const existing = await db.getAsync('SELECT * FROM holdings WHERE userId = $1 AND symbol = $2', req.user.id, symbol);
 
     let holdingsUpdated = false;
     try {
       if (existing) {
         const totalAmount = existing.amount + cryptoAmount;
-        const totalCost = (existing.amount * existing.averagePrice) + amountUSD;
+        const totalCost = (existing.amount * existing.averageprice) + amountUSD;
         const newAvg = totalCost / totalAmount;
         await db.runAsync(`
-          UPDATE holdings SET amount = ?, averagePrice = ?, updatedAt = strftime('%s', 'now')
-          WHERE userId = ? AND symbol = ?
-        `, totalAmount, newAvg, req.user.id, symbol);
+          UPDATE holdings SET amount = $1, averagePrice = $2, updatedAt = $3
+          WHERE userId = $4 AND symbol = $5
+        `, totalAmount, newAvg, nowUnix(), req.user.id, symbol);
         console.log(`[buy] Updated holdings for ${symbol}: amount=${totalAmount}, avg=${newAvg}`);
       } else {
         await db.runAsync(`
           INSERT INTO holdings (userId, symbol, amount, averagePrice, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-        `, req.user.id, symbol, cryptoAmount, price);
+          VALUES ($1, $2, $3, $4, $5, $5)
+        `, req.user.id, symbol, cryptoAmount, price, nowUnix());
         console.log(`[buy] Inserted new holding for ${symbol}: amount=${cryptoAmount}, price=${price}`);
       }
       holdingsUpdated = true;
@@ -2480,40 +2490,40 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
 
     const reference = generateReference();
     await db.runAsync(`
-      INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'trade', ?, 'completed', 'Buy ${symbol} with $${amountUSD}', ?)
-    `, req.user.id, amountUSD, reference);
+      INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+      VALUES ($1, 'trade', $2, 'completed', 'Buy ${symbol} with $${amountUSD}', $3, $4, $4)
+    `, req.user.id, amountUSD, reference, nowUnix());
 
     let cashbackAmount = 0;
     let finalBalance = newBalance;
     if (planConfig.cashbackPercent > 0) {
       cashbackAmount = amountUSD * (planConfig.cashbackPercent / 100);
       finalBalance = newBalance + cashbackAmount;
-      await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, finalBalance, req.user.id);
+      await db.runAsync(`UPDATE users SET balance = $1, updatedAt = $2 WHERE id = $3`, finalBalance, nowUnix(), req.user.id);
       const bonusRef = generateReference();
       await db.runAsync(`
-        INSERT INTO transactions (userId, type, amount, status, description, reference)
-        VALUES (?, 'bonus', ?, 'completed', 'Trading cashback (${planConfig.cashbackPercent}%) on $${amountUSD}', ?)
-      `, req.user.id, cashbackAmount, bonusRef);
+        INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+        VALUES ($1, 'bonus', $2, 'completed', 'Trading cashback (${planConfig.cashbackPercent}%) on $${amountUSD}', $3, $4, $4)
+      `, req.user.id, cashbackAmount, bonusRef, nowUnix());
       console.log(`[buy] Cashback ${cashbackAmount} credited to user ${req.user.id}`);
     }
 
-    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = $1', req.user.id);
     const updatedUser = rowToUser(updatedUserRow);
     delete updatedUser.password;
     delete updatedUser.verificationCode;
     delete updatedUser.verificationCodeExpires;
 
-    const updatedHoldings = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', req.user.id);
+    const updatedHoldings = await db.allAsync('SELECT * FROM holdings WHERE userId = $1', req.user.id);
     const symbols = updatedHoldings.map(h => h.symbol);
     const currentPrices = await getCryptoPrices(symbols);
     const holdingsWithPrice = updatedHoldings.map(h => ({
       symbol: h.symbol,
       amount: h.amount,
-      averagePrice: h.averagePrice,
+      averagePrice: h.averageprice,
       currentPrice: currentPrices[h.symbol] || 0,
       value: (currentPrices[h.symbol] || 0) * h.amount,
-      profitLoss: ((currentPrices[h.symbol] || 0) - h.averagePrice) * h.amount,
+      profitLoss: ((currentPrices[h.symbol] || 0) - h.averageprice) * h.amount,
     }));
 
     log('info', `User ${req.user.id} bought ${cryptoAmount} ${symbol} for $${amountUSD}, cashback: $${cashbackAmount}`);
@@ -2550,10 +2560,10 @@ app.post('/api/user/sell', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Unsupported crypto symbol.' });
     }
 
-    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = $1', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-    const holding = await db.getAsync('SELECT * FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
+    const holding = await db.getAsync('SELECT * FROM holdings WHERE userId = $1 AND symbol = $2', req.user.id, symbolUpper);
 
     if (!holding) {
       return res.status(400).json({ error: `You don't own any ${symbolUpper}.` });
@@ -2575,24 +2585,24 @@ app.post('/api/user/sell', authMiddleware, async (req, res) => {
     const newAmount = holding.amount - amount;
 
     if (newAmount <= 0.000001) {
-      await db.runAsync('DELETE FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
+      await db.runAsync('DELETE FROM holdings WHERE userId = $1 AND symbol = $2', req.user.id, symbolUpper);
     } else {
       await db.runAsync(`
-        UPDATE holdings SET amount = ?, updatedAt = strftime('%s', 'now')
-        WHERE userId = ? AND symbol = ?
-      `, newAmount, req.user.id, symbolUpper);
+        UPDATE holdings SET amount = $1, updatedAt = $2
+        WHERE userId = $3 AND symbol = $4
+      `, newAmount, nowUnix(), req.user.id, symbolUpper);
     }
 
     const newBalance = userRow.balance + usdValue;
-    await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, newBalance, req.user.id);
+    await db.runAsync(`UPDATE users SET balance = $1, updatedAt = $2 WHERE id = $3`, newBalance, nowUnix(), req.user.id);
 
     const reference = generateReference();
     await db.runAsync(`
-      INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'trade', ?, 'completed', 'Sell ${amount.toFixed(6)} ${symbolUpper} for $${usdValue.toFixed(2)}', ?)
-    `, req.user.id, usdValue, reference);
+      INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+      VALUES ($1, 'trade', $2, 'completed', 'Sell ${amount.toFixed(6)} ${symbolUpper} for $${usdValue.toFixed(2)}', $3, $4, $4)
+    `, req.user.id, usdValue, reference, nowUnix());
 
-    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = $1', req.user.id);
     const updatedUser = rowToUser(updatedUserRow);
     delete updatedUser.password;
     delete updatedUser.verificationCode;
@@ -2631,7 +2641,7 @@ app.get('/api/user/sell-preview', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be a positive number.' });
     }
 
-    const holding = await db.getAsync('SELECT amount FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
+    const holding = await db.getAsync('SELECT amount FROM holdings WHERE userId = $1 AND symbol = $2', req.user.id, symbolUpper);
 
     if (!holding || holding.amount < amountNum) {
       return res.status(400).json({
@@ -2681,14 +2691,14 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
 
     const info = await db.runAsync(`
       INSERT INTO support_tickets (userId, subject, category, priority, message, attachment, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-    `, req.user.id, subject, ticketCategory, ticketPriority, message, attachment || null);
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+    `, req.user.id, subject, ticketCategory, ticketPriority, message, attachment || null, nowUnix());
     const ticketId = info.lastInsertRowid;
 
-    const ticketRow = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
+    const ticketRow = await db.getAsync('SELECT * FROM support_tickets WHERE id = $1', ticketId);
     const ticket = ticketRow;
 
-    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
+    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = $1', req.user.id);
     if (userRow) {
       await sendSupportTicketEmail(userRow.email, userRow.name, ticket);
     }
@@ -2702,7 +2712,7 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
         category: ticket.category,
         priority: ticket.priority,
         status: ticket.status,
-        createdAt: new Date(ticket.createdAt * 1000)
+        createdAt: new Date(ticket.createdat * 1000)
       }
     });
   } catch (error) {
@@ -2716,15 +2726,15 @@ app.get('/api/user/support', authMiddleware, async (req, res) => {
     const tickets = await db.allAsync(`
       SELECT id, subject, category, priority, status, message, adminReply, createdAt, updatedAt
       FROM support_tickets
-      WHERE userId = ?
+      WHERE userId = $1
       ORDER BY createdAt DESC
     `, req.user.id);
 
     res.json({
       tickets: tickets.map(t => ({
         ...t,
-        createdAt: new Date(t.createdAt * 1000),
-        updatedAt: new Date(t.updatedAt * 1000)
+        createdAt: new Date(t.createdat * 1000),
+        updatedAt: new Date(t.updatedat * 1000)
       }))
     });
   } catch (error) {
@@ -2742,7 +2752,7 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, async (
       return res.status(400).json({ error: 'Reply message is required.' });
     }
 
-    const ticket = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
+    const ticket = await db.getAsync('SELECT * FROM support_tickets WHERE id = $1', ticketId);
     if (!ticket) {
       return res.status(404).json({ error: 'Ticket not found.' });
     }
@@ -2753,19 +2763,19 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, async (
 
     await db.runAsync(`
       UPDATE support_tickets
-      SET adminReply = ?, status = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, reply, finalStatus, ticketId);
+      SET adminReply = $1, status = $2, updatedAt = $3
+      WHERE id = $4
+    `, reply, finalStatus, nowUnix(), ticketId);
 
-    const updatedTicket = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
+    const updatedTicket = await db.getAsync('SELECT * FROM support_tickets WHERE id = $1', ticketId);
 
     log('info', `Support ticket ${ticketId} replied by admin`);
     res.json({
       message: 'Reply sent successfully.',
       ticket: {
         ...updatedTicket,
-        createdAt: new Date(updatedTicket.createdAt * 1000),
-        updatedAt: new Date(updatedTicket.updatedAt * 1000)
+        createdAt: new Date(updatedTicket.createdat * 1000),
+        updatedAt: new Date(updatedTicket.updatedat * 1000)
       }
     });
   } catch (error) {
@@ -2784,7 +2794,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
       SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
       FROM users ORDER BY createdAt DESC
     `);
-    res.json(rows.map(r => ({ ...r, createdAt: new Date(r.createdAt * 1000) })));
+    res.json(rows.map(r => ({ ...r, createdAt: new Date(r.createdat * 1000) })));
   } catch (error) {
     log('error', 'Get admin users error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -2795,10 +2805,10 @@ app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res
   try {
     const row = await db.getAsync(`
       SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
-      FROM users WHERE id = ?
+      FROM users WHERE id = $1
     `, req.params.id);
     if (!row) return res.status(404).json({ error: 'User not found.' });
-    res.json({ ...row, createdAt: new Date(row.createdAt * 1000) });
+    res.json({ ...row, createdAt: new Date(row.createdat * 1000) });
   } catch (error) {
     log('error', 'Get admin user error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -2819,21 +2829,21 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) =>
     `);
 
     const recentTransactions = await db.allAsync('SELECT * FROM transactions ORDER BY createdAt DESC LIMIT 20');
-    const deposits = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = "deposit" AND status = "completed"');
-    const withdrawals = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = "withdrawal" AND status = "completed"');
+    const deposits = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = $1 AND status = $2', 'deposit', 'completed');
+    const withdrawals = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = $1 AND status = $2', 'withdrawal', 'completed');
 
     res.json({
       users: {
-        total: totalUsers ? totalUsers.count : 0,
-        verified: verifiedUsers ? verifiedUsers.count : 0,
-        blocked: blockedUsers ? blockedUsers.count : 0,
+        total: totalUsers ? parseInt(totalUsers.count) : 0,
+        verified: verifiedUsers ? parseInt(verifiedUsers.count) : 0,
+        blocked: blockedUsers ? parseInt(blockedUsers.count) : 0,
       },
       finances: {
         totalBalance: totalBalance ? totalBalance.total || 0 : 0,
         totalDeposits: deposits ? deposits.total || 0 : 0,
         totalWithdrawals: withdrawals ? withdrawals.total || 0 : 0,
       },
-      plans: plans.map(p => ({ plan: p.selectedPlan, count: p.count })),
+      plans: plans.map(p => ({ plan: p.selectedplan, count: p.count })),
       recentTransactions: recentTransactions.map(rowToTransaction),
     });
   } catch (error) {
@@ -2848,14 +2858,14 @@ app.put('/api/admin/users/:id/block', authMiddleware, adminMiddleware, async (re
     if (typeof block !== 'boolean') return res.status(400).json({ error: 'Block must be true/false.' });
 
     const userId = req.params.id;
-    const userRow = await db.getAsync('SELECT id FROM users WHERE id = ?', userId);
+    const userRow = await db.getAsync('SELECT id FROM users WHERE id = $1', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
     await db.runAsync(`
-      UPDATE users SET blocked = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, block ? 1 : 0, userId);
+      UPDATE users SET blocked = $1, updatedAt = $2 WHERE id = $3
+    `, block ? 1 : 0, nowUnix(), userId);
 
-    const user = await db.getAsync('SELECT name, email FROM users WHERE id = ?', userId);
+    const user = await db.getAsync('SELECT name, email FROM users WHERE id = $1', userId);
     log('info', `User ${block ? 'blocked' : 'unblocked'}: ${user.email} (ID: ${userId})`);
     res.json({ message: `User ${block ? 'blocked' : 'unblocked'} successfully.` });
   } catch (error) {
@@ -2872,20 +2882,20 @@ app.put('/api/admin/users/:id/balance', authMiddleware, adminMiddleware, async (
     }
 
     const userId = req.params.id;
-    const userRow = await db.getAsync('SELECT id, name, email, balance FROM users WHERE id = ?', userId);
+    const userRow = await db.getAsync('SELECT id, name, email, balance FROM users WHERE id = $1', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
     const previousBalance = userRow.balance;
     await db.runAsync(`
-      UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, balance, userId);
+      UPDATE users SET balance = $1, updatedAt = $2 WHERE id = $3
+    `, balance, nowUnix(), userId);
 
     const diff = balance - previousBalance;
     if (diff !== 0) {
       await db.runAsync(`
-        INSERT INTO transactions (userId, type, amount, status, description, reference)
-        VALUES (?, 'trade', ?, 'completed', 'Admin balance adjustment', ?)
-      `, userId, Math.abs(diff), generateReference());
+        INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+        VALUES ($1, 'trade', $2, 'completed', 'Admin balance adjustment', $3, $4, $4)
+      `, userId, Math.abs(diff), generateReference(), nowUnix());
     }
 
     log('info', `Balance updated for user ${userRow.email}: $${previousBalance} -> $${balance}`);
@@ -2902,12 +2912,13 @@ app.get('/api/admin/transactions', authMiddleware, adminMiddleware, async (req, 
     let query = 'SELECT * FROM transactions';
     const params = [];
     const conditions = [];
+    let paramIdx = 1;
 
-    if (type) { conditions.push('type = ?'); params.push(type); }
-    if (status) { conditions.push('status = ?'); params.push(status); }
+    if (type) { conditions.push(`type = $${paramIdx++}`); params.push(type); }
+    if (status) { conditions.push(`status = $${paramIdx++}`); params.push(status); }
 
     if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
-    query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
+    query += ` ORDER BY createdAt DESC LIMIT $${paramIdx++} OFFSET $${paramIdx++}`;
     params.push(parseInt(limit), parseInt(offset));
 
     const rows = await db.allAsync(query, ...params);
@@ -2916,7 +2927,7 @@ app.get('/api/admin/transactions', authMiddleware, adminMiddleware, async (req, 
     let countQuery = 'SELECT COUNT(*) as total FROM transactions';
     if (conditions.length > 0) countQuery += ' WHERE ' + conditions.join(' AND ');
     const totalRow = await db.getAsync(countQuery, ...params.slice(0, -2));
-    const total = totalRow ? totalRow.total : 0;
+    const total = totalRow ? parseInt(totalRow.total) : 0;
 
     res.json({ transactions, pagination: { total, limit: parseInt(limit), offset: parseInt(offset) } });
   } catch (error) {
@@ -2948,55 +2959,56 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
         }
 
         // Use manual transaction with rollback on error
-        await db.execAsync('BEGIN TRANSACTION');
+        const client = await pool.connect();
         try {
+            await client.query('BEGIN');
             switch (action) {
                 case 'balance':
-                    await db.runAsync(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                    await client.query('UPDATE users SET balance = 50, updatedAt = $1 WHERE id = $2', [nowUnix(), userId]);
                     break;
                 case 'plan':
-                    await db.runAsync(`UPDATE users SET selectedPlan = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                    await client.query('UPDATE users SET selectedPlan = NULL, updatedAt = $1 WHERE id = $2', [nowUnix(), userId]);
                     break;
                 case 'holdings':
-                    await db.runAsync(`DELETE FROM holdings WHERE userId = ?`, userId);
+                    await client.query('DELETE FROM holdings WHERE userId = $1', [userId]);
                     break;
                 case 'transactions':
-                    await db.runAsync(`DELETE FROM transactions WHERE userId = ?`, userId);
+                    await client.query('DELETE FROM transactions WHERE userId = $1', [userId]);
                     const bonusRef = generateReference();
-                    await db.runAsync(`
+                    await client.query(`
                         INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
-                        VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
-                    `, userId, bonusRef);
-                    await db.runAsync(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                        VALUES ($1, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', $2, $3, $3)
+                    `, [userId, bonusRef, nowUnix()]);
+                    await client.query('UPDATE users SET balance = 50, updatedAt = $1 WHERE id = $2', [nowUnix(), userId]);
                     break;
                 case 'profile':
-                    await db.runAsync(`
-                        UPDATE users SET profilePicture = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?
-                    `, userId);
+                    await client.query('UPDATE users SET profilePicture = NULL, updatedAt = $1 WHERE id = $2', [nowUnix(), userId]);
                     break;
                 case 'all':
-                    await db.runAsync(`DELETE FROM holdings WHERE userId = ?`, userId);
-                    await db.runAsync(`DELETE FROM transactions WHERE userId = ?`, userId);
+                    await client.query('DELETE FROM holdings WHERE userId = $1', [userId]);
+                    await client.query('DELETE FROM transactions WHERE userId = $1', [userId]);
                     const allBonusRef = generateReference();
-                    await db.runAsync(`
+                    await client.query(`
                         INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
-                        VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
-                    `, userId, allBonusRef);
-                    await db.runAsync(`
-                        UPDATE users SET balance = 50, selectedPlan = NULL, profilePicture = NULL, updatedAt = strftime('%s', 'now')
-                        WHERE id = ?
-                    `, userId);
+                        VALUES ($1, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', $2, $3, $3)
+                    `, [userId, allBonusRef, nowUnix()]);
+                    await client.query(`
+                        UPDATE users SET balance = 50, selectedPlan = NULL, profilePicture = NULL, updatedAt = $1
+                        WHERE id = $2
+                    `, [nowUnix(), userId]);
                     break;
                 default:
                     throw new Error('Invalid action');
             }
-            await db.execAsync('COMMIT');
+            await client.query('COMMIT');
         } catch (innerError) {
-            await db.execAsync('ROLLBACK');
+            await client.query('ROLLBACK');
             throw innerError;
+        } finally {
+            client.release();
         }
 
-        const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', userId);
+        const userRow = await db.getAsync('SELECT * FROM users WHERE id = $1', userId);
         if (!userRow) {
             return res.status(404).json({ error: 'User not found after reset.' });
         }
@@ -3005,7 +3017,7 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
         delete user.verificationCode;
         delete user.verificationCodeExpires;
 
-        const transactions = await db.allAsync('SELECT * FROM transactions WHERE userId = ? ORDER BY createdAt DESC', userId);
+        const transactions = await db.allAsync('SELECT * FROM transactions WHERE userId = $1 ORDER BY createdAt DESC', userId);
 
         log('info', `User ${userId} reset ${action}`);
         res.json({
@@ -3022,13 +3034,13 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
 app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const userId = req.params.id;
-    const userRow = await db.getAsync('SELECT id, email FROM users WHERE id = ?', userId);
+    const userRow = await db.getAsync('SELECT id, email FROM users WHERE id = $1', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     if (parseInt(userId) === req.user.id) {
       return res.status(400).json({ error: 'Cannot delete your own account.' });
     }
 
-    await db.runAsync('DELETE FROM users WHERE id = ?', userId);
+    await db.runAsync('DELETE FROM users WHERE id = $1', userId);
     log('info', `User deleted: ${userRow.email} (ID: ${userId})`);
     res.json({ message: 'User deleted successfully.' });
   } catch (error) {
