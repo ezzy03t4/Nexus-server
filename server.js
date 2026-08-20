@@ -1,5 +1,5 @@
 // ================================================================
-// SERVER.JS — Full implementation with deposit, withdrawal, support & trading
+// SERVER.JS — Full implementation with PostgreSQL persistence
 // ================================================================
 
 require('dotenv').config();
@@ -8,8 +8,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
-const sqlite3 = require('sqlite3').verbose();
-const { promisify } = require('util');
+const { Pool } = require('pg');
 const axios = require('axios');
 const multer = require('multer');
 const path = require('path');
@@ -19,6 +18,8 @@ const fs = require('fs');
 // EXPRESS APP
 // ================================================================
 const app = express();
+
+// CORS – allow localhost and production frontend
 const allowedOrigins = [
   'http://127.0.0.1:5500',
   'http://localhost:5500',
@@ -29,6 +30,10 @@ const allowedOrigins = [
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
+    // Allow any localhost port
+    if (origin.match(/^https?:\/\/localhost:\d+$/) || origin.match(/^https?:\/\/127\.0\.0\.1:\d+$/)) {
+      return callback(null, true);
+    }
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
@@ -99,37 +104,29 @@ setInterval(() => {
 app.use(rateLimiter);
 
 // ================================================================
-// SQLITE DATABASE (with full schema and migrations) - using sqlite3
+// POSTGRESQL DATABASE
 // ================================================================
-const db = new sqlite3.Database(process.env.DATABASE_PATH || 'database.sqlite');
-db.run('PRAGMA foreign_keys = ON');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // required for Render
+});
 
-// After db initialization
-db.getAsync = promisify(db.get).bind(db);
-db.allAsync = promisify(db.all).bind(db);
-
-// Custom runAsync that returns { lastInsertRowid, changes }
-db.runAsync = function(sql, ...params) {
-  return new Promise((resolve, reject) => {
-    this.run(sql, params, function(err) {
-      if (err) reject(err);
-      else resolve({ lastInsertRowid: this.lastID, changes: this.changes });
-    });
-  });
+// Helper to promisify pool.query
+pool.queryAsync = async (text, params) => {
+  const res = await pool.query(text, params);
+  return res;
 };
 
-db.execAsync = promisify(db.exec).bind(db);
-
 // ================================================================
-// INITIALIZE DATABASE (migrations) — fully async
+// INITIALIZE DATABASE – creates all tables if they don't exist
 // ================================================================
 async function initDatabase() {
-  console.log('🔄 Running database schema migrations...');
+  console.log('🔄 Creating PostgreSQL schema...');
 
   // Users table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password TEXT NOT NULL,
@@ -143,17 +140,17 @@ async function initDatabase() {
       verified INTEGER DEFAULT 0,
       verificationCode TEXT DEFAULT NULL,
       verificationCodeExpires INTEGER DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now'))
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW()),
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())
     )
   `);
   console.log('✅ Users table ready');
 
   // Transactions table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
       amount REAL NOT NULL,
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
@@ -161,77 +158,77 @@ async function initDatabase() {
       description TEXT DEFAULT '',
       reference TEXT DEFAULT NULL,
       proof TEXT DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW()),
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW()),
       completedAt INTEGER DEFAULT NULL,
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      currency TEXT DEFAULT 'USD',
+      originalAmount REAL DEFAULT 0,
+      exchangeRate REAL DEFAULT 1,
+      feePercent REAL DEFAULT 0,
+      feeAmount REAL DEFAULT 0
     )
   `);
   console.log('✅ Transactions table ready');
 
   // Notifications table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS notifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       title TEXT NOT NULL,
       message TEXT NOT NULL,
       type TEXT DEFAULT 'info',
       isRead INTEGER DEFAULT 0,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())
     )
   `);
   console.log('✅ Notifications table ready');
 
   // Sessions table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       token TEXT NOT NULL UNIQUE,
       expiresAt INTEGER NOT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())
     )
   `);
   console.log('✅ Sessions table ready');
 
   // Daily usage table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS daily_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       date TEXT NOT NULL,
       action TEXT NOT NULL,
       count INTEGER DEFAULT 0,
-      UNIQUE(userId, date, action),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      UNIQUE(userId, date, action)
     )
   `);
   console.log('✅ Daily usage table ready');
 
   // Holdings table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS holdings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       symbol TEXT NOT NULL,
       amount REAL NOT NULL,
       averagePrice REAL NOT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW()),
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW()),
       UNIQUE(userId, symbol)
     )
   `);
   console.log('✅ Holdings table ready');
 
   // Support tickets table
-  await db.execAsync(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS support_tickets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      userId INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       subject TEXT NOT NULL,
       category TEXT NOT NULL,
       priority TEXT NOT NULL,
@@ -239,117 +236,13 @@ async function initDatabase() {
       attachment TEXT DEFAULT NULL,
       status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
       adminReply TEXT DEFAULT NULL,
-      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      createdAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW()),
+      updatedAt INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())
     )
   `);
   console.log('✅ Support tickets table ready');
 
-  // ---- Migrations: ensure all columns exist ----
-  // Users
-  const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
-  const existingUserCols = userTableInfo.map(c => c.name);
-  const userColumnsToAdd = [
-    { name: 'profilePicture', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'selectedPlan', type: 'TEXT DEFAULT NULL' },
-    { name: 'balance', type: 'REAL DEFAULT 0' },
-    { name: 'isAdmin', type: 'INTEGER DEFAULT 0' },
-    { name: 'blocked', type: 'INTEGER DEFAULT 0' },
-    { name: 'verified', type: 'INTEGER DEFAULT 0' },
-    { name: 'verificationCode', type: 'TEXT DEFAULT NULL' },
-    { name: 'verificationCodeExpires', type: 'INTEGER DEFAULT NULL' }
-  ];
-  for (const col of userColumnsToAdd) {
-    if (!existingUserCols.includes(col.name)) {
-      console.log(`🔄 Adding ${col.name} column to users...`);
-      await db.execAsync(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
-      console.log(`✅ ${col.name} column added.`);
-    }
-  }
-  await db.execAsync('UPDATE users SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-  // Transactions
-  const txTableInfo = await db.allAsync("PRAGMA table_info(transactions)");
-  const existingTxCols = txTableInfo.map(c => c.name);
-  const txColumnsToAdd = [
-    { name: 'proof', type: 'TEXT DEFAULT NULL' },
-    { name: 'description', type: 'TEXT DEFAULT ""' },
-    { name: 'completedAt', type: 'INTEGER DEFAULT NULL' },
-    { name: 'method', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'currency', type: 'TEXT DEFAULT "USD"' },
-    { name: 'originalAmount', type: 'REAL DEFAULT 0' },
-    { name: 'exchangeRate', type: 'REAL DEFAULT 1' },
-    { name: 'feePercent', type: 'REAL DEFAULT 0' },
-    { name: 'feeAmount', type: 'REAL DEFAULT 0' }
-  ];
-  for (const col of txColumnsToAdd) {
-    if (!existingTxCols.includes(col.name)) {
-      console.log(`🔄 Adding ${col.name} column to transactions...`);
-      await db.execAsync(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
-      console.log(`✅ ${col.name} column added.`);
-    }
-  }
-  await db.execAsync('UPDATE transactions SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-  // Fix transactions CHECK constraint to include 'plan_purchase'
-  const txCreateSql = await db.getAsync("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'");
-  if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
-    console.log('🔄 Recreating transactions table to add plan_purchase...');
-    await db.execAsync('BEGIN TRANSACTION');
-    await db.execAsync(`
-      CREATE TABLE transactions_new (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        userId INTEGER NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
-        amount REAL NOT NULL,
-        status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
-        method TEXT DEFAULT NULL,
-        description TEXT DEFAULT '',
-        reference TEXT DEFAULT NULL,
-        proof TEXT DEFAULT NULL,
-        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-        updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-        completedAt INTEGER DEFAULT NULL,
-        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-      )
-    `);
-    await db.execAsync(`
-      INSERT INTO transactions_new (
-        id, userId, type, amount, status, method, description,
-        reference, proof, createdAt, updatedAt, completedAt
-      )
-      SELECT
-        id, userId, type, amount, status, method, description,
-        reference, proof, createdAt, updatedAt, completedAt
-      FROM transactions
-    `);
-    await db.execAsync('DROP TABLE transactions');
-    await db.execAsync('ALTER TABLE transactions_new RENAME TO transactions');
-    await db.execAsync('COMMIT');
-    console.log('✅ transactions table recreated with updated CHECK constraint.');
-  }
-
-  // Support tickets
-  const supportTableInfo = await db.allAsync("PRAGMA table_info(support_tickets)");
-  const existingSupportCols = supportTableInfo.map(c => c.name);
-  const supportColumnsToAdd = [
-    { name: 'attachment', type: 'TEXT DEFAULT NULL' },
-    { name: 'adminReply', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
-  ];
-  for (const col of supportColumnsToAdd) {
-    if (!existingSupportCols.includes(col.name)) {
-      console.log(`🔄 Adding ${col.name} column to support_tickets...`);
-      await db.execAsync(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
-      console.log(`✅ ${col.name} column added.`);
-    }
-  }
-  await db.execAsync('UPDATE support_tickets SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-  console.log('✅ Database schema and migrations applied.');
+  console.log('✅ Database schema initialized.');
 }
 
 // ================================================================
@@ -448,16 +341,19 @@ function getTodayDate() {
 }
 
 async function getDailyUsage(userId, action, date) {
-  const row = await db.getAsync('SELECT count FROM daily_usage WHERE userId = ? AND date = ? AND action = ?', userId, date, action);
-  return row ? row.count : 0;
+  const res = await pool.query(
+    'SELECT count FROM daily_usage WHERE userId = $1 AND date = $2 AND action = $3',
+    [userId, date, action]
+  );
+  return res.rows.length ? res.rows[0].count : 0;
 }
 
 async function incrementDailyUsage(userId, action, date) {
-  await db.runAsync(`
+  await pool.query(`
     INSERT INTO daily_usage (userId, date, action, count)
-    VALUES (?, ?, ?, 1)
-    ON CONFLICT(userId, date, action) DO UPDATE SET count = count + 1
-  `, userId, date, action);
+    VALUES ($1, $2, $3, 1)
+    ON CONFLICT (userId, date, action) DO UPDATE SET count = daily_usage.count + 1
+  `, [userId, date, action]);
 }
 
 async function checkAndIncrementDailyLimit(userId, action, limit) {
@@ -631,14 +527,14 @@ async function getCryptoPrices(symbols) {
 async function seedAdmin() {
   const adminEmail = 'admin@nexus.com';
   const adminPassword = 'Admin123!';
-  const existing = await db.getAsync('SELECT id FROM users WHERE email = ?', adminEmail);
-  if (!existing) {
+  const res = await pool.query('SELECT id FROM users WHERE email = $1', [adminEmail]);
+  if (res.rows.length === 0) {
     const salt = await bcrypt.genSalt(10);
     const hashed = await bcrypt.hash(adminPassword, salt);
-    await db.runAsync(`
+    await pool.query(`
       INSERT INTO users (name, email, password, country, isAdmin, verified, balance)
-      VALUES ('Admin', ?, ?, 'Global', 1, 1, 0)
-    `, adminEmail, hashed);
+      VALUES ('Admin', $1, $2, 'Global', 1, 1, 0)
+    `, [adminEmail, hashed]);
     console.log('✅ Default admin created: admin@nexus.com / Admin123!');
   }
 }
@@ -1108,7 +1004,7 @@ const sendSupportTicketEmail = async (userEmail, userName, ticket) => {
 };
 
 // ================================================================
-// AUTH MIDDLEWARE (async)
+// AUTH MIDDLEWARE
 // ================================================================
 const authMiddleware = async (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -1127,7 +1023,8 @@ const authMiddleware = async (req, res, next) => {
 
 const adminMiddleware = async (req, res, next) => {
   try {
-    const userRow = await db.getAsync('SELECT isAdmin FROM users WHERE id = ?', req.user.id);
+    const resQuery = await pool.query('SELECT isAdmin FROM users WHERE id = $1', [req.user.id]);
+    const userRow = resQuery.rows[0];
     if (!userRow || !userRow.isAdmin) return res.status(403).json({ error: 'Admin access required.' });
     next();
   } catch (error) {
@@ -1149,8 +1046,8 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const existing = await db.getAsync('SELECT id FROM users WHERE email = ?', email);
-    if (existing) return res.status(400).json({ error: 'User already exists.' });
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length > 0) return res.status(400).json({ error: 'User already exists.' });
 
     const verificationCode = generateVerificationCode();
     const codeExpires = Math.floor(Date.now() / 1000) + 10 * 60;
@@ -1158,26 +1055,24 @@ app.post('/api/auth/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const info = await db.runAsync(`
+    const insertUser = await pool.query(`
       INSERT INTO users (
         name, email, password, country, phone,
         verificationCode, verificationCodeExpires, verified, balance, updatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 50, strftime('%s', 'now'))
-    `, name, email, hashedPassword, country, phone || '', verificationCode, codeExpires);
-    const userId = info.lastInsertRowid;
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 50, EXTRACT(EPOCH FROM NOW()))
+      RETURNING id
+    `, [name, email, hashedPassword, country, phone || '', verificationCode, codeExpires]);
+    const userId = insertUser.rows[0].id;
 
-    await db.runAsync(`
+    await pool.query(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?)
-    `, userId, generateReference());
+      VALUES ($1, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', $2)
+    `, [userId, generateReference()]);
 
-    // --- Email sending (now wrapped) ---
     try {
       await sendVerificationEmail(email, verificationCode);
     } catch (emailError) {
-      // Log the error but do NOT fail the registration
       console.error('⚠️ Email could not be sent:', emailError.message);
-      // Optionally, you can store the error in a log table, but we just log it.
     }
 
     log('info', `New user registered: ${email} (ID: ${userId})`);
@@ -1200,9 +1095,9 @@ app.post('/api/auth/verify', async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: 'Email and code are required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const user = rowToUser(userRes.rows[0]);
 
     if (user.verified) return res.status(400).json({ error: 'Email already verified.' });
     if (user.verificationCode !== code) return res.status(400).json({ error: 'Invalid code.' });
@@ -1210,13 +1105,13 @@ app.post('/api/auth/verify', async (req, res) => {
       return res.status(400).json({ error: 'Code expired. Request a new one.' });
     }
 
-    await db.runAsync(`
-      UPDATE users SET verified = 1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, user.id);
+    await pool.query(`
+      UPDATE users SET verified = 1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $1
+    `, [user.id]);
 
-    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = ?', user.id);
-    const updatedUser = rowToUser(updatedRow);
+    const updatedRes = await pool.query('SELECT * FROM users WHERE id = $1', [user.id]);
+    const updatedUser = rowToUser(updatedRes.rows[0]);
     const token = jwt.sign(
       { id: updatedUser.id, email: updatedUser.email },
       process.env.JWT_SECRET,
@@ -1252,18 +1147,18 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const user = rowToUser(userRes.rows[0]);
 
     if (user.verified) return res.status(400).json({ error: 'Email already verified.' });
 
     const verificationCode = generateVerificationCode();
     const codeExpires = Math.floor(Date.now() / 1000) + 10 * 60;
-    await db.runAsync(`
-      UPDATE users SET verificationCode = ?, verificationCodeExpires = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, verificationCode, codeExpires, user.id);
+    await pool.query(`
+      UPDATE users SET verificationCode = $1, verificationCodeExpires = $2, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $3
+    `, [verificationCode, codeExpires, user.id]);
 
     await sendVerificationEmail(email, verificationCode);
     res.json({ message: 'New verification code sent.' });
@@ -1278,9 +1173,9 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
-    if (!userRow) return res.status(401).json({ error: 'Invalid credentials.' });
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials.' });
+    const user = rowToUser(userRes.rows[0]);
 
     if (user.blocked) {
       return res.status(403).json({ error: 'Account blocked. Contact support.' });
@@ -1292,7 +1187,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Please verify your email before logging in.' });
     }
 
-    await db.runAsync(`UPDATE users SET updatedAt = strftime('%s', 'now') WHERE id = ?`, user.id);
+    await pool.query(`UPDATE users SET updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1`, [user.id]);
 
     const token = jwt.sign(
       { id: user.id, email: user.email },
@@ -1329,18 +1224,18 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
-    if (!userRow) {
+    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) {
       return res.json({ message: 'If an account exists, a reset code has been sent.' });
     }
-    const user = rowToUser(userRow);
+    const user = rowToUser(userRes.rows[0]);
 
     const resetCode = generateResetCode();
     const codeExpires = Math.floor(Date.now() / 1000) + 15 * 60;
-    await db.runAsync(`
-      UPDATE users SET verificationCode = ?, verificationCodeExpires = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, resetCode, codeExpires, user.id);
+    await pool.query(`
+      UPDATE users SET verificationCode = $1, verificationCodeExpires = $2, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $3
+    `, [resetCode, codeExpires, user.id]);
 
     await sendPasswordResetEmail(email, resetCode);
     res.json({ message: 'If an account exists, a reset code has been sent.' });
@@ -1360,9 +1255,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const user = rowToUser(userRes.rows[0]);
 
     if (user.verificationCode !== code) return res.status(400).json({ error: 'Invalid reset code.' });
     if (user.verificationCodeExpires < new Date()) {
@@ -1372,10 +1267,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    await db.runAsync(`
-      UPDATE users SET password = ?, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, hashedPassword, user.id);
+    await pool.query(`
+      UPDATE users SET password = $1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $2
+    `, [hashedPassword, user.id]);
 
     log('info', `Password reset for user: ${email} (ID: ${user.id})`);
     res.json({ message: 'Password reset successfully. Please login with your new password.' });
@@ -1391,9 +1286,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 app.get('/api/user/me', authMiddleware, async (req, res) => {
   try {
-    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const user = rowToUser(userRes.rows[0]);
     delete user.password;
     delete user.verificationCode;
     delete user.verificationCodeExpires;
@@ -1408,38 +1303,26 @@ app.put('/api/user/update', authMiddleware, async (req, res) => {
   try {
     const { name, phone, country, profilePicture } = req.body;
 
-    const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
-    const existingColumns = userTableInfo.map(c => c.name);
-
-    const columnsToEnsure = ['profilePicture', 'updatedAt', 'selectedPlan', 'balance'];
-    for (const col of columnsToEnsure) {
-      if (!existingColumns.includes(col)) {
-        console.log(`⚠️ Column ${col} missing – adding now...`);
-        await db.execAsync(`ALTER TABLE users ADD COLUMN ${col} TEXT DEFAULT NULL`);
-        console.log(`✅ Column ${col} added.`);
-      }
-    }
-
     const updates = [];
     const values = [];
 
-    if (name !== undefined) { updates.push('name = ?'); values.push(name); }
-    if (phone !== undefined) { updates.push('phone = ?'); values.push(phone); }
-    if (country !== undefined) { updates.push('country = ?'); values.push(country); }
-    if (profilePicture !== undefined) { updates.push('profilePicture = ?'); values.push(profilePicture); }
+    if (name !== undefined) { updates.push(`name = $${values.length + 1}`); values.push(name); }
+    if (phone !== undefined) { updates.push(`phone = $${values.length + 1}`); values.push(phone); }
+    if (country !== undefined) { updates.push(`country = $${values.length + 1}`); values.push(country); }
+    if (profilePicture !== undefined) { updates.push(`profilePicture = $${values.length + 1}`); values.push(profilePicture); }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No fields to update.' });
     }
 
-    updates.push(`updatedAt = strftime('%s', 'now')`);
+    updates.push(`updatedAt = EXTRACT(EPOCH FROM NOW())`);
     values.push(req.user.id);
 
-    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
-    await db.runAsync(query, ...values);
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${values.length}`;
+    await pool.query(query, values);
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const user = rowToUser(userRes.rows[0]);
     delete user.password;
     delete user.verificationCode;
     delete user.verificationCodeExpires;
@@ -1447,7 +1330,7 @@ app.put('/api/user/update', authMiddleware, async (req, res) => {
     log('info', `Profile updated for user ${user.email} (ID: ${user.id})`);
     res.json({ message: 'Profile updated successfully.', user });
   } catch (error) {
-    log('error', 'Update user error', { message: error.message, stack: error.stack, code: error.code });
+    log('error', 'Update user error', { message: error.message, stack: error.stack });
     console.error('Update error details:', error);
     res.status(500).json({ error: 'Server error: ' + error.message });
   }
@@ -1463,9 +1346,9 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters.' });
     }
 
-    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const user = rowToUser(userRow);
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const user = rowToUser(userRes.rows[0]);
 
     const isMatch = await bcrypt.compare(currentPassword, user.password);
     if (!isMatch) return res.status(400).json({ error: 'Current password is incorrect.' });
@@ -1473,9 +1356,9 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    await db.runAsync(`
-      UPDATE users SET password = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, hashedPassword, user.id);
+    await pool.query(`
+      UPDATE users SET password = $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2
+    `, [hashedPassword, user.id]);
 
     log('info', `Password changed for user ${user.email} (ID: ${user.id})`);
     res.json({ message: 'Password changed successfully.' });
@@ -1488,28 +1371,30 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
 app.get('/api/user/transactions', authMiddleware, async (req, res) => {
   try {
     const { limit = 50, offset = 0, type } = req.query;
-    let query = 'SELECT * FROM transactions WHERE userId = ?';
+    let query = 'SELECT * FROM transactions WHERE userId = $1';
     const params = [req.user.id];
+    let paramIndex = 2;
 
     if (type) {
-      query += ' AND type = ?';
+      query += ` AND type = $${paramIndex}`;
       params.push(type);
+      paramIndex++;
     }
 
-    query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
+    query += ` ORDER BY createdAt DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     params.push(parseInt(limit), parseInt(offset));
 
-    const rows = await db.allAsync(query, ...params);
-    const transactions = rows.map(rowToTransaction);
+    const rowsRes = await pool.query(query, params);
+    const transactions = rowsRes.rows.map(rowToTransaction);
 
-    let countQuery = 'SELECT COUNT(*) as total FROM transactions WHERE userId = ?';
+    let countQuery = 'SELECT COUNT(*) as total FROM transactions WHERE userId = $1';
     const countParams = [req.user.id];
     if (type) {
-      countQuery += ' AND type = ?';
+      countQuery += ' AND type = $2';
       countParams.push(type);
     }
-    const totalRow = await db.getAsync(countQuery, ...countParams);
-    const total = totalRow ? totalRow.total : 0;
+    const countRes = await pool.query(countQuery, countParams);
+    const total = parseInt(countRes.rows[0].total);
 
     res.json({ transactions, pagination: { total, limit: parseInt(limit), offset: parseInt(offset) } });
   } catch (error) {
@@ -1520,9 +1405,9 @@ app.get('/api/user/transactions', authMiddleware, async (req, res) => {
 
 app.get('/api/user/balance', authMiddleware, async (req, res) => {
   try {
-    const row = await db.getAsync('SELECT balance FROM users WHERE id = ?', req.user.id);
-    if (!row) return res.status(404).json({ error: 'User not found.' });
-    res.json({ balance: row.balance || 0 });
+    const resQuery = await pool.query('SELECT balance FROM users WHERE id = $1', [req.user.id]);
+    if (resQuery.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    res.json({ balance: resQuery.rows[0].balance || 0 });
   } catch (error) {
     log('error', 'Get balance error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -1571,20 +1456,32 @@ app.post('/api/user/deposit', authMiddleware, async (req, res) => {
         const reference = generateReference();
         const description = `Deposit via ${method || 'bank'} (${originalAmount} ${originalCurrency} → $${usdAmount.toFixed(2)} USD, fee: ${feePercent}%)`;
 
-        const info = await db.runAsync(`
+        const insertTx = await pool.query(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference, proof,
                 currency, originalAmount, exchangeRate, feePercent, feeAmount
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, req.user.id, 'deposit', finalUsdAmount, method || 'bank', description, reference, proof || null,
-            originalCurrency, originalAmount, exchangeRate, feePercent, feeAmount);
-        const transactionId = info.lastInsertRowid;
-        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-        const transaction = rowToTransaction(transactionRow);
+            ) VALUES ($1, 'deposit', $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id
+        `, [
+            req.user.id,
+            finalUsdAmount,
+            method || 'bank',
+            description,
+            reference,
+            proof || null,
+            originalCurrency,
+            originalAmount,
+            exchangeRate,
+            feePercent,
+            feeAmount
+        ]);
+        const transactionId = insertTx.rows[0].id;
+        const txRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+        const transaction = rowToTransaction(txRes.rows[0]);
 
-        const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
-        if (userRow) {
-            await sendDepositNotificationEmail(userRow.email, userRow.name, transaction, proof || null);
+        const userRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
+        if (userRes.rows.length > 0) {
+            await sendDepositNotificationEmail(userRes.rows[0].email, userRes.rows[0].name, transaction, proof || null);
         }
 
         log('info', `Deposit created: ${originalAmount} ${originalCurrency} → $${finalUsdAmount} USD for user ${req.user.id}`);
@@ -1645,19 +1542,21 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
             });
         }
 
-        const userRow = await db.getAsync('SELECT email, name FROM users WHERE id = ?', user.id);
-        if (!userRow) {
+        const userRes = await pool.query('SELECT email, name FROM users WHERE id = $1', [user.id]);
+        if (userRes.rows.length === 0) {
             return res.status(404).json({ error: 'User not found.' });
         }
+        const userRow = userRes.rows[0];
 
         const reference = generateReference();
         log('info', `Flutterwave: Creating payment for reference: ${reference}, amount: ${depositAmount} ${currency}`);
 
-        const info = await db.runAsync(`
+        const insertTx = await pool.query(`
             INSERT INTO transactions (userId, type, amount, status, method, description, reference, proof)
-            VALUES (?, 'deposit', ?, 'pending', 'card', 'Flutterwave deposit', ?, ?)
-        `, user.id, depositAmount, reference, 'pending');
-        const transactionId = info.lastInsertRowid;
+            VALUES ($1, 'deposit', $2, 'pending', 'card', 'Flutterwave deposit', $3, 'pending')
+            RETURNING id
+        `, [user.id, depositAmount, reference]);
+        const transactionId = insertTx.rows[0].id;
 
         const redirectUrl = `http://localhost:5000/api/deposit/verify/${reference}`;
 
@@ -1697,7 +1596,7 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         if (response.data.status === 'success') {
             const paymentLink = response.data.data.link;
             log('info', `Flutterwave: Payment link created: ${paymentLink}`);
-            await db.runAsync(`UPDATE transactions SET proof = ? WHERE id = ?`, paymentLink, transactionId);
+            await pool.query(`UPDATE transactions SET proof = $1 WHERE id = $2`, [paymentLink, transactionId]);
 
             res.json({
                 success: true,
@@ -1735,11 +1634,11 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
         const reference = req.params.reference;
         const userId = req.user.id;
 
-        const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = ? AND userId = ?', reference, userId);
-
-        if (!tx) {
+        const txRes = await pool.query('SELECT * FROM transactions WHERE reference = $1 AND userId = $2', [reference, userId]);
+        if (txRes.rows.length === 0) {
             return res.status(404).json({ status: 'not_found', error: 'Transaction not found.' });
         }
+        const tx = txRes.rows[0];
 
         if (tx.status === 'completed') {
             return res.json({ status: 'completed' });
@@ -1755,11 +1654,11 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
             );
             const data = response.data;
             if (data.status === 'success' && data.data.status === 'successful') {
-                await db.runAsync(`UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
-                await db.runAsync(`UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, tx.amount, userId);
+                await pool.query(`UPDATE transactions SET status = 'completed', completedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1`, [tx.id]);
+                await pool.query(`UPDATE users SET balance = balance + $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2`, [tx.amount, userId]);
                 return res.json({ status: 'completed' });
             } else if (data.data.status === 'failed') {
-                await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
+                await pool.query(`UPDATE transactions SET status = 'failed', completedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1`, [tx.id]);
                 return res.json({ status: 'failed' });
             } else {
                 return res.json({ status: 'pending' });
@@ -1768,7 +1667,7 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
             if (apiError.response && apiError.response.status === 400) {
                 const errorData = apiError.response.data;
                 if (errorData && errorData.message && errorData.message.includes('No transaction was found')) {
-                    const createdAt = tx.createdAt;
+                    const createdAt = tx.createdat; // column name is createdAt
                     const now = Math.floor(Date.now() / 1000);
                     const age = now - createdAt;
                     if (age < 120) {
@@ -1776,7 +1675,7 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
                         return res.json({ status: 'pending' });
                     } else {
                         log('info', `Transaction ${reference} marked as failed (not found on Flutterwave after ${age}s)`);
-                        await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
+                        await pool.query(`UPDATE transactions SET status = 'failed', completedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1`, [tx.id]);
                         return res.json({ status: 'failed', message: 'Transaction not found on Flutterwave' });
                     }
                 }
@@ -1803,41 +1702,44 @@ app.post('/api/webhooks/flutterwave', express.json(), async (req, res) => {
             const txRef = event.data.tx_ref;
             const status = event.data.status;
 
-            const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = ?', txRef);
-            if (!tx || tx.status === 'completed') {
+            const txRes = await pool.query('SELECT * FROM transactions WHERE reference = $1', [txRef]);
+            if (txRes.rows.length === 0 || txRes.rows[0].status === 'completed') {
                 return res.status(200).send('OK');
             }
+            const tx = txRes.rows[0];
 
             if (status === 'successful') {
-                await db.runAsync(`
-                    UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now')
-                    WHERE id = ?
-                `, tx.id);
+                await pool.query(`
+                    UPDATE transactions SET status = 'completed', completedAt = EXTRACT(EPOCH FROM NOW())
+                    WHERE id = $1
+                `, [tx.id]);
 
-                await db.runAsync(`
-                    UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now')
-                    WHERE id = ?
-                `, tx.amount, tx.userId);
+                await pool.query(`
+                    UPDATE users SET balance = balance + $1, updatedAt = EXTRACT(EPOCH FROM NOW())
+                    WHERE id = $2
+                `, [tx.amount, tx.userid]);
 
-                log('info', `Webhook: Deposit ${tx.amount} completed for user ${tx.userId}`);
+                log('info', `Webhook: Deposit ${tx.amount} completed for user ${tx.userid}`);
 
                 try {
-                    const user = await db.getAsync('SELECT name, email FROM users WHERE id = ?', tx.userId);
-                    if (user) {
-                        await sendDepositNotificationEmail(user.email, user.name, tx, null);
+                    const userRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [tx.userid]);
+                    if (userRes.rows.length > 0) {
+                        const user = userRes.rows[0];
+                        const transaction = rowToTransaction(tx);
+                        await sendDepositNotificationEmail(user.email, user.name, transaction, null);
                         log('info', `Admin email sent for card deposit ${txRef} (user: ${user.email})`);
                     } else {
-                        log('warn', `User not found for card deposit ${txRef} (userId: ${tx.userId})`);
+                        log('warn', `User not found for card deposit ${txRef} (userId: ${tx.userid})`);
                     }
                 } catch (emailError) {
                     log('error', 'Failed to send admin email for card deposit', { error: emailError.message });
                 }
 
             } else if (status === 'failed') {
-                await db.runAsync(`
-                    UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now')
-                    WHERE id = ?
-                `, tx.id);
+                await pool.query(`
+                    UPDATE transactions SET status = 'failed', completedAt = EXTRACT(EPOCH FROM NOW())
+                    WHERE id = $1
+                `, [tx.id]);
             }
         }
 
@@ -1867,8 +1769,9 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
       return res.status(400).json({ error: 'Proof image is required (as file or base64).' });
     }
 
-    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ? AND userId = ?', transactionId, req.user.id);
-    if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
+    const txRes = await pool.query('SELECT * FROM transactions WHERE id = $1 AND userId = $2', [transactionId, req.user.id]);
+    if (txRes.rows.length === 0) return res.status(404).json({ error: 'Transaction not found.' });
+    const transaction = txRes.rows[0];
     if (transaction.status !== 'pending') return res.status(400).json({ error: 'Transaction already processed.' });
     if (transaction.type !== 'deposit') return res.status(400).json({ error: 'Not a deposit.' });
 
@@ -1880,20 +1783,22 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
       proofForDb = `data:${mimeType};base64,${base64}`;
     }
 
-    await db.runAsync(`
-      UPDATE transactions SET proof = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, proofForDb, transactionId);
+    await pool.query(`
+      UPDATE transactions SET proof = $1, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $2
+    `, [proofForDb, transactionId]);
 
-    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
-    await sendDepositProofEmail(userRow.email, userRow.name, transaction, proofData);
+    const userRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length > 0) {
+      await sendDepositProofEmail(userRes.rows[0].email, userRes.rows[0].name, transaction, proofData);
+    }
 
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
-    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-    const updatedTransaction = rowToTransaction(updatedTransactionRow);
+    const updatedTxRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+    const updatedTransaction = rowToTransaction(updatedTxRes.rows[0]);
 
     log('info', `Deposit proof uploaded for transaction ${transactionId} by user ${req.user.id}`);
     res.json({
@@ -1954,13 +1859,13 @@ app.post('/api/contact', async (req, res) => {
 
 app.get('/api/admin/support', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const tickets = await db.allAsync(`
+    const ticketsRes = await pool.query(`
       SELECT st.*, u.name as userName, u.email as userEmail
       FROM support_tickets st
       LEFT JOIN users u ON st.userId = u.id
       ORDER BY st.createdAt DESC
     `);
-    res.json({ tickets });
+    res.json({ tickets: ticketsRes.rows });
   } catch (error) {
     log('error', 'Get admin support error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -1974,18 +1879,18 @@ app.post('/api/admin/notify', authMiddleware, adminMiddleware, async (req, res) 
       return res.status(400).json({ error: 'Title and message are required.' });
     }
 
-    const users = await db.allAsync('SELECT id FROM users');
+    const usersRes = await pool.query('SELECT id FROM users');
     const now = Math.floor(Date.now() / 1000);
 
-    for (const user of users) {
-      await db.runAsync(`
+    for (const user of usersRes.rows) {
+      await pool.query(`
         INSERT INTO notifications (userId, title, message, type, createdAt)
-        VALUES (?, ?, ?, ?, ?)
-      `, user.id, title, message, type, now);
+        VALUES ($1, $2, $3, $4, $5)
+      `, [user.id, title, message, type, now]);
     }
 
-    log('info', `Broadcast notification sent to ${users.length} users`);
-    res.json({ message: `Notification sent to ${users.length} users.` });
+    log('info', `Broadcast notification sent to ${usersRes.rows.length} users`);
+    res.json({ message: `Notification sent to ${usersRes.rows.length} users.` });
   } catch (error) {
     log('error', 'Broadcast notification error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -1994,13 +1899,13 @@ app.post('/api/admin/notify', authMiddleware, adminMiddleware, async (req, res) 
 
 app.get('/api/user/notifications', authMiddleware, async (req, res) => {
   try {
-    const notifications = await db.allAsync(`
+    const notifRes = await pool.query(`
       SELECT * FROM notifications
-      WHERE userId = ?
+      WHERE userId = $1
       ORDER BY createdAt DESC
       LIMIT 50
-    `, req.user.id);
-    res.json({ notifications });
+    `, [req.user.id]);
+    res.json({ notifications: notifRes.rows });
   } catch (error) {
     log('error', 'Get notifications error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -2016,19 +1921,20 @@ app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, async (req
       return res.status(400).json({ error: 'Invalid plan name.' });
     }
 
-    const userRow = await db.getAsync('SELECT id, name, email FROM users WHERE id = ?', userId);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
+    const userRes = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const userRow = userRes.rows[0];
 
-    await db.runAsync(`
-      UPDATE users SET selectedPlan = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, planName, userId);
+    await pool.query(`
+      UPDATE users SET selectedPlan = $1, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $2
+    `, [planName, userId]);
 
     const reference = generateReference();
-    await db.runAsync(`
+    await pool.query(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'plan_purchase', 0, 'completed', 'Admin assigned plan: ' || ?, ?)
-    `, userId, planName, reference);
+      VALUES ($1, 'plan_purchase', 0, 'completed', 'Admin assigned plan: ' || $2, $3)
+    `, [userId, planName, reference]);
 
     log('info', `Admin assigned plan ${planName} to user ${userRow.email}`);
     res.json({ message: `Plan "${planName}" assigned to user.` });
@@ -2047,29 +1953,30 @@ app.put('/api/admin/deposit/:id/confirm', authMiddleware, adminMiddleware, async
       return res.status(400).json({ error: 'Status must be "completed" or "failed".' });
     }
 
-    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-    if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
+    const txRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+    if (txRes.rows.length === 0) return res.status(404).json({ error: 'Transaction not found.' });
+    const transaction = txRes.rows[0];
     if (transaction.status !== 'pending' && transaction.status !== 'processing') {
       return res.status(400).json({ error: 'Transaction already finalized.' });
     }
     if (transaction.type !== 'deposit') return res.status(400).json({ error: 'Not a deposit.' });
 
-    await db.runAsync(`
-      UPDATE transactions SET status = ?, completedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, status, transactionId);
+    await pool.query(`
+      UPDATE transactions SET status = $1, completedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $2
+    `, [status, transactionId]);
 
     if (status === 'completed') {
-      await db.runAsync(`
-        UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now')
-        WHERE id = ?
-      `, transaction.amount, transaction.userId);
+      await pool.query(`
+        UPDATE users SET balance = balance + $1, updatedAt = EXTRACT(EPOCH FROM NOW())
+        WHERE id = $2
+      `, [transaction.amount, transaction.userid]);
     }
 
-    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-    const updatedTransaction = rowToTransaction(updatedTransactionRow);
+    const updatedTxRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+    const updatedTransaction = rowToTransaction(updatedTxRes.rows[0]);
 
-    log('info', `Deposit ${status}: $${transaction.amount} for user ${transaction.userId}`);
+    log('info', `Deposit ${status}: $${transaction.amount} for user ${transaction.userid}`);
     res.json({ message: `Deposit ${status} successfully.`, transaction: updatedTransaction });
   } catch (error) {
     log('error', 'Confirm deposit error', error);
@@ -2090,8 +1997,9 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
         if (!address) return res.status(400).json({ error: 'Address is required.' });
 
         const withdrawAmount = parseFloat(amount);
-        const userRow = await db.getAsync('SELECT balance FROM users WHERE id = ?', req.user.id);
-        if (!userRow) return res.status(404).json({ error: 'User not found.' });
+        const userRes = await pool.query('SELECT balance FROM users WHERE id = $1', [req.user.id]);
+        if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+        const balance = userRes.rows[0].balance;
 
         let usdAmount = withdrawAmount;
         let exchangeRate = 1;
@@ -2112,32 +2020,43 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
         feeAmount = usdAmount * (feePercent / 100);
         const totalUsdRequired = usdAmount + feeAmount;
 
-        if (totalUsdRequired > userRow.balance) {
+        if (totalUsdRequired > balance) {
             return res.status(400).json({
                 error: `Insufficient balance. Need $${totalUsdRequired.toFixed(2)} USD (${withdrawAmount} ${targetCurrency} + ${feePercent}% fee).`,
-                balance: userRow.balance,
+                balance: balance,
                 required: totalUsdRequired,
-                shortfall: totalUsdRequired - userRow.balance
+                shortfall: totalUsdRequired - balance
             });
         }
 
         const reference = generateReference();
         const description = `Withdrawal to ${address} (${withdrawAmount} ${targetCurrency})`;
 
-        const info = await db.runAsync(`
+        const insertTx = await pool.query(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference,
                 currency, originalAmount, exchangeRate, feePercent, feeAmount
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
-        `, req.user.id, 'withdrawal', usdAmount, method || 'bank', description, reference,
-            targetCurrency, withdrawAmount, exchangeRate, feePercent, feeAmount);
-        const transactionId = info.lastInsertRowid;
-        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-        const transaction = rowToTransaction(transactionRow);
+            ) VALUES ($1, 'withdrawal', $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
+        `, [
+            req.user.id,
+            usdAmount,
+            method || 'bank',
+            description,
+            reference,
+            targetCurrency,
+            withdrawAmount,
+            exchangeRate,
+            feePercent,
+            feeAmount
+        ]);
+        const transactionId = insertTx.rows[0].id;
+        const txRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+        const transaction = rowToTransaction(txRes.rows[0]);
 
-        const userData = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
-        if (userData) {
-            await sendWithdrawalNotificationEmail(userData.email, userData.name, transaction);
+        const userDataRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
+        if (userDataRes.rows.length > 0) {
+            await sendWithdrawalNotificationEmail(userDataRes.rows[0].email, userDataRes.rows[0].name, transaction);
         }
 
         log('info', `Withdrawal created: ${withdrawAmount} ${targetCurrency} ($${usdAmount} USD + ${feePercent}% fee) for user ${req.user.id}`);
@@ -2166,27 +2085,28 @@ app.put('/api/admin/withdraw/:id/confirm', authMiddleware, adminMiddleware, asyn
       return res.status(400).json({ error: 'Status must be "completed" or "failed".' });
     }
 
-    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-    if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
+    const txRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+    if (txRes.rows.length === 0) return res.status(404).json({ error: 'Transaction not found.' });
+    const transaction = txRes.rows[0];
     if (transaction.status !== 'pending') return res.status(400).json({ error: 'Already processed.' });
     if (transaction.type !== 'withdrawal') return res.status(400).json({ error: 'Not a withdrawal.' });
 
-    await db.runAsync(`
-      UPDATE transactions SET status = ?, completedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, status, transactionId);
+    await pool.query(`
+      UPDATE transactions SET status = $1, completedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $2
+    `, [status, transactionId]);
 
     if (status === 'completed') {
-      await db.runAsync(`
-        UPDATE users SET balance = balance - ?, updatedAt = strftime('%s', 'now')
-        WHERE id = ?
-      `, transaction.amount, transaction.userId);
+      await pool.query(`
+        UPDATE users SET balance = balance - $1, updatedAt = EXTRACT(EPOCH FROM NOW())
+        WHERE id = $2
+      `, [transaction.amount, transaction.userid]);
     }
 
-    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
-    const updatedTransaction = rowToTransaction(updatedTransactionRow);
+    const updatedTxRes = await pool.query('SELECT * FROM transactions WHERE id = $1', [transactionId]);
+    const updatedTransaction = rowToTransaction(updatedTxRes.rows[0]);
 
-    log('info', `Withdrawal ${status}: $${transaction.amount} for user ${transaction.userId}`);
+    log('info', `Withdrawal ${status}: $${transaction.amount} for user ${transaction.userid}`);
     res.json({ message: `Withdrawal ${status} successfully.`, transaction: updatedTransaction });
   } catch (error) {
     log('error', 'Confirm withdrawal error', error);
@@ -2212,10 +2132,11 @@ app.post('/api/plans/select', authMiddleware, async (req, res) => {
     }
     const price = planConfig.price;
 
-    const userRow = await db.getAsync('SELECT id, name, email, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
+    const userRes = await pool.query('SELECT id, name, email, balance, selectedPlan FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const userRow = userRes.rows[0];
 
-    const currentPlan = userRow.selectedPlan;
+    const currentPlan = userRow.selectedplan;
     if (currentPlan) {
       const currentLevel = PLAN_ORDER[currentPlan];
       const newLevel = PLAN_ORDER[planName];
@@ -2244,18 +2165,18 @@ app.post('/api/plans/select', authMiddleware, async (req, res) => {
     }
 
     const newBalance = currentBalance - price;
-    await db.runAsync(`
-      UPDATE users SET selectedPlan = ?, balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, planName, newBalance, req.user.id);
+    await pool.query(`
+      UPDATE users SET selectedPlan = $1, balance = $2, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $3
+    `, [planName, newBalance, req.user.id]);
 
     const reference = generateReference();
-    await db.runAsync(`
+    await pool.query(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'plan_purchase', ?, 'completed', 'Plan purchase: ' || ?, ?)
-    `, req.user.id, price, planName, reference);
+      VALUES ($1, 'plan_purchase', $2, 'completed', 'Plan purchase: ' || $3, $4)
+    `, [req.user.id, price, planName, reference]);
 
-    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
-    const user = rowToUser(updatedRow);
+    const updatedRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const user = rowToUser(updatedRes.rows[0]);
     delete user.password;
     delete user.verificationCode;
     delete user.verificationCodeExpires;
@@ -2313,9 +2234,9 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const userRow = await db.getAsync('SELECT selectedPlan FROM users WHERE id = ?', userId);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    const planName = userRow.selectedPlan || 'Starter';
+    const userRes = await pool.query('SELECT selectedPlan FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const planName = userRes.rows[0].selectedplan || 'Starter';
     const planConfig = PLAN_CONFIG[planName];
     if (!planConfig) {
       return res.status(400).json({ error: 'Invalid plan.' });
@@ -2332,8 +2253,8 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
       });
     }
 
-    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', userId);
-    if (holdingsRows.length === 0) {
+    const holdingsRes = await pool.query('SELECT * FROM holdings WHERE userId = $1', [userId]);
+    if (holdingsRes.rows.length === 0) {
       return res.json({
         holdings: [],
         totalValue: 0,
@@ -2343,16 +2264,16 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
       });
     }
 
-    const symbols = holdingsRows.map(h => h.symbol);
+    const symbols = holdingsRes.rows.map(h => h.symbol);
     const prices = await getCryptoPrices(symbols);
 
-    const holdings = holdingsRows.map(h => ({
+    const holdings = holdingsRes.rows.map(h => ({
       symbol: h.symbol,
       amount: h.amount,
-      averagePrice: h.averagePrice,
+      averagePrice: h.averageprice,
       currentPrice: prices[h.symbol] || 0,
       value: (prices[h.symbol] || 0) * h.amount,
-      profitLoss: ((prices[h.symbol] || 0) - h.averagePrice) * h.amount,
+      profitLoss: ((prices[h.symbol] || 0) - h.averageprice) * h.amount,
     }));
 
     const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
@@ -2377,21 +2298,21 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
 app.get('/api/user/holdings', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', userId);
-    if (holdingsRows.length === 0) {
+    const holdingsRes = await pool.query('SELECT * FROM holdings WHERE userId = $1', [userId]);
+    if (holdingsRes.rows.length === 0) {
       return res.json({ holdings: [], totalValue: 0 });
     }
 
-    const symbols = holdingsRows.map(h => h.symbol);
+    const symbols = holdingsRes.rows.map(h => h.symbol);
     const prices = await getCryptoPrices(symbols);
 
-    const holdings = holdingsRows.map(h => ({
+    const holdings = holdingsRes.rows.map(h => ({
       symbol: h.symbol,
       amount: h.amount,
-      averagePrice: h.averagePrice,
+      averagePrice: h.averageprice,
       currentPrice: prices[h.symbol] || 0,
       value: (prices[h.symbol] || 0) * h.amount,
-      profitLoss: ((prices[h.symbol] || 0) - h.averagePrice) * h.amount,
+      profitLoss: ((prices[h.symbol] || 0) - h.averageprice) * h.amount,
     }));
 
     const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
@@ -2414,13 +2335,14 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Unsupported crypto symbol.' });
     }
 
-    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
-    if (!userRow.selectedPlan) {
+    const userRes = await pool.query('SELECT id, balance, selectedPlan FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const userRow = userRes.rows[0];
+    if (!userRow.selectedplan) {
       return res.status(400).json({ error: 'You must purchase a plan before trading.' });
     }
 
-    const planConfig = PLAN_CONFIG[userRow.selectedPlan];
+    const planConfig = PLAN_CONFIG[userRow.selectedplan];
     if (!planConfig) {
       return res.status(400).json({ error: 'Invalid plan. Please contact support.' });
     }
@@ -2432,7 +2354,7 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
 
     if (amountUSD > planConfig.maxTrade) {
       return res.status(400).json({
-        error: `Your current plan (${userRow.selectedPlan}) allows a maximum trade of $${planConfig.maxTrade}. Please upgrade to trade larger amounts.`
+        error: `Your current plan (${userRow.selectedplan}) allows a maximum trade of $${planConfig.maxTrade}. Please upgrade to trade larger amounts.`
       });
     }
 
@@ -2449,27 +2371,28 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
 
     const newBalance = userRow.balance - amountUSD;
 
-    await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, newBalance, req.user.id);
+    await pool.query(`UPDATE users SET balance = $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2`, [newBalance, req.user.id]);
     console.log(`[buy] User ${req.user.id} balance updated to ${newBalance}`);
 
-    const existing = await db.getAsync('SELECT * FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbol);
+    const existingRes = await pool.query('SELECT * FROM holdings WHERE userId = $1 AND symbol = $2', [req.user.id, symbol]);
 
     let holdingsUpdated = false;
     try {
-      if (existing) {
+      if (existingRes.rows.length > 0) {
+        const existing = existingRes.rows[0];
         const totalAmount = existing.amount + cryptoAmount;
-        const totalCost = (existing.amount * existing.averagePrice) + amountUSD;
+        const totalCost = (existing.amount * existing.averageprice) + amountUSD;
         const newAvg = totalCost / totalAmount;
-        await db.runAsync(`
-          UPDATE holdings SET amount = ?, averagePrice = ?, updatedAt = strftime('%s', 'now')
-          WHERE userId = ? AND symbol = ?
-        `, totalAmount, newAvg, req.user.id, symbol);
+        await pool.query(`
+          UPDATE holdings SET amount = $1, averagePrice = $2, updatedAt = EXTRACT(EPOCH FROM NOW())
+          WHERE userId = $3 AND symbol = $4
+        `, [totalAmount, newAvg, req.user.id, symbol]);
         console.log(`[buy] Updated holdings for ${symbol}: amount=${totalAmount}, avg=${newAvg}`);
       } else {
-        await db.runAsync(`
+        await pool.query(`
           INSERT INTO holdings (userId, symbol, amount, averagePrice, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-        `, req.user.id, symbol, cryptoAmount, price);
+          VALUES ($1, $2, $3, $4, EXTRACT(EPOCH FROM NOW()), EXTRACT(EPOCH FROM NOW()))
+        `, [req.user.id, symbol, cryptoAmount, price]);
         console.log(`[buy] Inserted new holding for ${symbol}: amount=${cryptoAmount}, price=${price}`);
       }
       holdingsUpdated = true;
@@ -2479,41 +2402,41 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
     }
 
     const reference = generateReference();
-    await db.runAsync(`
+    await pool.query(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'trade', ?, 'completed', 'Buy ${symbol} with $${amountUSD}', ?)
-    `, req.user.id, amountUSD, reference);
+      VALUES ($1, 'trade', $2, 'completed', 'Buy ${symbol} with $${amountUSD}', $3)
+    `, [req.user.id, amountUSD, reference]);
 
     let cashbackAmount = 0;
     let finalBalance = newBalance;
     if (planConfig.cashbackPercent > 0) {
       cashbackAmount = amountUSD * (planConfig.cashbackPercent / 100);
       finalBalance = newBalance + cashbackAmount;
-      await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, finalBalance, req.user.id);
+      await pool.query(`UPDATE users SET balance = $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2`, [finalBalance, req.user.id]);
       const bonusRef = generateReference();
-      await db.runAsync(`
+      await pool.query(`
         INSERT INTO transactions (userId, type, amount, status, description, reference)
-        VALUES (?, 'bonus', ?, 'completed', 'Trading cashback (${planConfig.cashbackPercent}%) on $${amountUSD}', ?)
-      `, req.user.id, cashbackAmount, bonusRef);
+        VALUES ($1, 'bonus', $2, 'completed', 'Trading cashback (${planConfig.cashbackPercent}%) on $${amountUSD}', $3)
+      `, [req.user.id, cashbackAmount, bonusRef]);
       console.log(`[buy] Cashback ${cashbackAmount} credited to user ${req.user.id}`);
     }
 
-    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
-    const updatedUser = rowToUser(updatedUserRow);
+    const updatedUserRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const updatedUser = rowToUser(updatedUserRes.rows[0]);
     delete updatedUser.password;
     delete updatedUser.verificationCode;
     delete updatedUser.verificationCodeExpires;
 
-    const updatedHoldings = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', req.user.id);
-    const symbols = updatedHoldings.map(h => h.symbol);
+    const updatedHoldingsRes = await pool.query('SELECT * FROM holdings WHERE userId = $1', [req.user.id]);
+    const symbols = updatedHoldingsRes.rows.map(h => h.symbol);
     const currentPrices = await getCryptoPrices(symbols);
-    const holdingsWithPrice = updatedHoldings.map(h => ({
+    const holdingsWithPrice = updatedHoldingsRes.rows.map(h => ({
       symbol: h.symbol,
       amount: h.amount,
-      averagePrice: h.averagePrice,
+      averagePrice: h.averageprice,
       currentPrice: currentPrices[h.symbol] || 0,
       value: (currentPrices[h.symbol] || 0) * h.amount,
-      profitLoss: ((currentPrices[h.symbol] || 0) - h.averagePrice) * h.amount,
+      profitLoss: ((currentPrices[h.symbol] || 0) - h.averageprice) * h.amount,
     }));
 
     log('info', `User ${req.user.id} bought ${cryptoAmount} ${symbol} for $${amountUSD}, cashback: $${cashbackAmount}`);
@@ -2529,9 +2452,6 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('[buy] Unhandled error:', error);
     log('error', 'Buy crypto error', { message: error.message, code: error.code, stack: error.stack });
-    if (error.code === 'SQLITE_ERROR') {
-      return res.status(500).json({ error: 'Database error. Please ensure the holdings table exists and try again.' });
-    }
     res.status(500).json({ error: 'Server error: ' + error.message });
   }
 });
@@ -2550,14 +2470,14 @@ app.post('/api/user/sell', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Unsupported crypto symbol.' });
     }
 
-    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
+    const userRes = await pool.query('SELECT id, balance, selectedPlan FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
 
-    const holding = await db.getAsync('SELECT * FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
-
-    if (!holding) {
+    const holdingRes = await pool.query('SELECT * FROM holdings WHERE userId = $1 AND symbol = $2', [req.user.id, symbolUpper]);
+    if (holdingRes.rows.length === 0) {
       return res.status(400).json({ error: `You don't own any ${symbolUpper}.` });
     }
+    const holding = holdingRes.rows[0];
 
     if (holding.amount < amount) {
       return res.status(400).json({
@@ -2575,25 +2495,25 @@ app.post('/api/user/sell', authMiddleware, async (req, res) => {
     const newAmount = holding.amount - amount;
 
     if (newAmount <= 0.000001) {
-      await db.runAsync('DELETE FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
+      await pool.query('DELETE FROM holdings WHERE userId = $1 AND symbol = $2', [req.user.id, symbolUpper]);
     } else {
-      await db.runAsync(`
-        UPDATE holdings SET amount = ?, updatedAt = strftime('%s', 'now')
-        WHERE userId = ? AND symbol = ?
-      `, newAmount, req.user.id, symbolUpper);
+      await pool.query(`
+        UPDATE holdings SET amount = $1, updatedAt = EXTRACT(EPOCH FROM NOW())
+        WHERE userId = $2 AND symbol = $3
+      `, [newAmount, req.user.id, symbolUpper]);
     }
 
-    const newBalance = userRow.balance + usdValue;
-    await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, newBalance, req.user.id);
+    const newBalance = userRes.rows[0].balance + usdValue;
+    await pool.query(`UPDATE users SET balance = $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2`, [newBalance, req.user.id]);
 
     const reference = generateReference();
-    await db.runAsync(`
+    await pool.query(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
-      VALUES (?, 'trade', ?, 'completed', 'Sell ${amount.toFixed(6)} ${symbolUpper} for $${usdValue.toFixed(2)}', ?)
-    `, req.user.id, usdValue, reference);
+      VALUES ($1, 'trade', $2, 'completed', 'Sell ${amount.toFixed(6)} ${symbolUpper} for $${usdValue.toFixed(2)}', $3)
+    `, [req.user.id, usdValue, reference]);
 
-    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
-    const updatedUser = rowToUser(updatedUserRow);
+    const updatedUserRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const updatedUser = rowToUser(updatedUserRes.rows[0]);
     delete updatedUser.password;
     delete updatedUser.verificationCode;
     delete updatedUser.verificationCodeExpires;
@@ -2631,12 +2551,13 @@ app.get('/api/user/sell-preview', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be a positive number.' });
     }
 
-    const holding = await db.getAsync('SELECT amount FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
+    const holdingRes = await pool.query('SELECT amount FROM holdings WHERE userId = $1 AND symbol = $2', [req.user.id, symbolUpper]);
+    const available = holdingRes.rows.length > 0 ? holdingRes.rows[0].amount : 0;
 
-    if (!holding || holding.amount < amountNum) {
+    if (available < amountNum) {
       return res.status(400).json({
         error: 'Insufficient balance.',
-        available: holding ? holding.amount : 0,
+        available: available,
         requested: amountNum
       });
     }
@@ -2653,7 +2574,7 @@ app.get('/api/user/sell-preview', authMiddleware, async (req, res) => {
       amount: amountNum,
       price: prices[symbolUpper],
       usdValue: usdValue,
-      available: holding.amount
+      available: available
     });
   } catch (error) {
     log('error', 'Sell preview error', error);
@@ -2679,18 +2600,19 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
     const ticketCategory = validCategories.includes(category) ? category : 'general';
     const ticketPriority = validPriorities.includes(priority) ? priority : 'medium';
 
-    const info = await db.runAsync(`
+    const insertTicket = await pool.query(`
       INSERT INTO support_tickets (userId, subject, category, priority, message, attachment, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-    `, req.user.id, subject, ticketCategory, ticketPriority, message, attachment || null);
-    const ticketId = info.lastInsertRowid;
+      VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW()), EXTRACT(EPOCH FROM NOW()))
+      RETURNING id
+    `, [req.user.id, subject, ticketCategory, ticketPriority, message, attachment || null]);
+    const ticketId = insertTicket.rows[0].id;
 
-    const ticketRow = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
-    const ticket = ticketRow;
+    const ticketRes = await pool.query('SELECT * FROM support_tickets WHERE id = $1', [ticketId]);
+    const ticket = ticketRes.rows[0];
 
-    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
-    if (userRow) {
-      await sendSupportTicketEmail(userRow.email, userRow.name, ticket);
+    const userRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length > 0) {
+      await sendSupportTicketEmail(userRes.rows[0].email, userRes.rows[0].name, ticket);
     }
 
     log('info', `Support ticket created: ${subject} for user ${req.user.id} (ID: ${ticketId})`);
@@ -2702,7 +2624,7 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
         category: ticket.category,
         priority: ticket.priority,
         status: ticket.status,
-        createdAt: new Date(ticket.createdAt * 1000)
+        createdAt: new Date(ticket.createdat * 1000)
       }
     });
   } catch (error) {
@@ -2713,18 +2635,18 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
 
 app.get('/api/user/support', authMiddleware, async (req, res) => {
   try {
-    const tickets = await db.allAsync(`
+    const ticketsRes = await pool.query(`
       SELECT id, subject, category, priority, status, message, adminReply, createdAt, updatedAt
       FROM support_tickets
-      WHERE userId = ?
+      WHERE userId = $1
       ORDER BY createdAt DESC
-    `, req.user.id);
+    `, [req.user.id]);
 
     res.json({
-      tickets: tickets.map(t => ({
+      tickets: ticketsRes.rows.map(t => ({
         ...t,
-        createdAt: new Date(t.createdAt * 1000),
-        updatedAt: new Date(t.updatedAt * 1000)
+        createdAt: new Date(t.createdat * 1000),
+        updatedAt: new Date(t.updatedat * 1000)
       }))
     });
   } catch (error) {
@@ -2742,30 +2664,32 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, async (
       return res.status(400).json({ error: 'Reply message is required.' });
     }
 
-    const ticket = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
-    if (!ticket) {
+    const ticketRes = await pool.query('SELECT * FROM support_tickets WHERE id = $1', [ticketId]);
+    if (ticketRes.rows.length === 0) {
       return res.status(404).json({ error: 'Ticket not found.' });
     }
+    const ticket = ticketRes.rows[0];
 
     const newStatus = status || ticket.status;
     const validStatuses = ['open', 'in_progress', 'resolved', 'closed'];
     const finalStatus = validStatuses.includes(newStatus) ? newStatus : ticket.status;
 
-    await db.runAsync(`
+    await pool.query(`
       UPDATE support_tickets
-      SET adminReply = ?, status = ?, updatedAt = strftime('%s', 'now')
-      WHERE id = ?
-    `, reply, finalStatus, ticketId);
+      SET adminReply = $1, status = $2, updatedAt = EXTRACT(EPOCH FROM NOW())
+      WHERE id = $3
+    `, [reply, finalStatus, ticketId]);
 
-    const updatedTicket = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
+    const updatedTicketRes = await pool.query('SELECT * FROM support_tickets WHERE id = $1', [ticketId]);
+    const updatedTicket = updatedTicketRes.rows[0];
 
     log('info', `Support ticket ${ticketId} replied by admin`);
     res.json({
       message: 'Reply sent successfully.',
       ticket: {
         ...updatedTicket,
-        createdAt: new Date(updatedTicket.createdAt * 1000),
-        updatedAt: new Date(updatedTicket.updatedAt * 1000)
+        createdAt: new Date(updatedTicket.createdat * 1000),
+        updatedAt: new Date(updatedTicket.updatedat * 1000)
       }
     });
   } catch (error) {
@@ -2780,11 +2704,11 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, async (
 
 app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const rows = await db.allAsync(`
+    const rowsRes = await pool.query(`
       SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
       FROM users ORDER BY createdAt DESC
     `);
-    res.json(rows.map(r => ({ ...r, createdAt: new Date(r.createdAt * 1000) })));
+    res.json(rowsRes.rows.map(r => ({ ...r, createdAt: new Date(r.createdat * 1000) })));
   } catch (error) {
     log('error', 'Get admin users error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -2793,12 +2717,13 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
 
 app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const row = await db.getAsync(`
+    const rowRes = await pool.query(`
       SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
-      FROM users WHERE id = ?
-    `, req.params.id);
-    if (!row) return res.status(404).json({ error: 'User not found.' });
-    res.json({ ...row, createdAt: new Date(row.createdAt * 1000) });
+      FROM users WHERE id = $1
+    `, [req.params.id]);
+    if (rowRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const r = rowRes.rows[0];
+    res.json({ ...r, createdAt: new Date(r.createdat * 1000) });
   } catch (error) {
     log('error', 'Get admin user error', error);
     res.status(500).json({ error: 'Server error.' });
@@ -2807,34 +2732,34 @@ app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res
 
 app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const totalUsers = await db.getAsync('SELECT COUNT(*) as count FROM users');
-    const verifiedUsers = await db.getAsync('SELECT COUNT(*) as count FROM users WHERE verified = 1');
-    const blockedUsers = await db.getAsync('SELECT COUNT(*) as count FROM users WHERE blocked = 1');
-    const totalBalance = await db.getAsync('SELECT SUM(balance) as total FROM users');
-    const plans = await db.allAsync(`
+    const totalUsers = await pool.query('SELECT COUNT(*) as count FROM users');
+    const verifiedUsers = await pool.query('SELECT COUNT(*) as count FROM users WHERE verified = 1');
+    const blockedUsers = await pool.query('SELECT COUNT(*) as count FROM users WHERE blocked = 1');
+    const totalBalance = await pool.query('SELECT SUM(balance) as total FROM users');
+    const plans = await pool.query(`
       SELECT selectedPlan, COUNT(*) as count
       FROM users
       WHERE selectedPlan IS NOT NULL
       GROUP BY selectedPlan
     `);
 
-    const recentTransactions = await db.allAsync('SELECT * FROM transactions ORDER BY createdAt DESC LIMIT 20');
-    const deposits = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = "deposit" AND status = "completed"');
-    const withdrawals = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = "withdrawal" AND status = "completed"');
+    const recentTransactions = await pool.query('SELECT * FROM transactions ORDER BY createdAt DESC LIMIT 20');
+    const deposits = await pool.query('SELECT SUM(amount) as total FROM transactions WHERE type = $1 AND status = $2', ['deposit', 'completed']);
+    const withdrawals = await pool.query('SELECT SUM(amount) as total FROM transactions WHERE type = $1 AND status = $2', ['withdrawal', 'completed']);
 
     res.json({
       users: {
-        total: totalUsers ? totalUsers.count : 0,
-        verified: verifiedUsers ? verifiedUsers.count : 0,
-        blocked: blockedUsers ? blockedUsers.count : 0,
+        total: parseInt(totalUsers.rows[0].count),
+        verified: parseInt(verifiedUsers.rows[0].count),
+        blocked: parseInt(blockedUsers.rows[0].count),
       },
       finances: {
-        totalBalance: totalBalance ? totalBalance.total || 0 : 0,
-        totalDeposits: deposits ? deposits.total || 0 : 0,
-        totalWithdrawals: withdrawals ? withdrawals.total || 0 : 0,
+        totalBalance: totalBalance.rows[0].total || 0,
+        totalDeposits: deposits.rows[0].total || 0,
+        totalWithdrawals: withdrawals.rows[0].total || 0,
       },
-      plans: plans.map(p => ({ plan: p.selectedPlan, count: p.count })),
-      recentTransactions: recentTransactions.map(rowToTransaction),
+      plans: plans.rows.map(p => ({ plan: p.selectedplan, count: p.count })),
+      recentTransactions: recentTransactions.rows.map(rowToTransaction),
     });
   } catch (error) {
     log('error', 'Get admin stats error', error);
@@ -2848,15 +2773,15 @@ app.put('/api/admin/users/:id/block', authMiddleware, adminMiddleware, async (re
     if (typeof block !== 'boolean') return res.status(400).json({ error: 'Block must be true/false.' });
 
     const userId = req.params.id;
-    const userRow = await db.getAsync('SELECT id FROM users WHERE id = ?', userId);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
+    const userRes = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
 
-    await db.runAsync(`
-      UPDATE users SET blocked = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, block ? 1 : 0, userId);
+    await pool.query(`
+      UPDATE users SET blocked = $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2
+    `, [block ? 1 : 0, userId]);
 
-    const user = await db.getAsync('SELECT name, email FROM users WHERE id = ?', userId);
-    log('info', `User ${block ? 'blocked' : 'unblocked'}: ${user.email} (ID: ${userId})`);
+    const user = await pool.query('SELECT name, email FROM users WHERE id = $1', [userId]);
+    log('info', `User ${block ? 'blocked' : 'unblocked'}: ${user.rows[0].email} (ID: ${userId})`);
     res.json({ message: `User ${block ? 'blocked' : 'unblocked'} successfully.` });
   } catch (error) {
     log('error', 'Block user error', error);
@@ -2872,20 +2797,21 @@ app.put('/api/admin/users/:id/balance', authMiddleware, adminMiddleware, async (
     }
 
     const userId = req.params.id;
-    const userRow = await db.getAsync('SELECT id, name, email, balance FROM users WHERE id = ?', userId);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
+    const userRes = await pool.query('SELECT id, name, email, balance FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    const userRow = userRes.rows[0];
 
     const previousBalance = userRow.balance;
-    await db.runAsync(`
-      UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `, balance, userId);
+    await pool.query(`
+      UPDATE users SET balance = $1, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $2
+    `, [balance, userId]);
 
     const diff = balance - previousBalance;
     if (diff !== 0) {
-      await db.runAsync(`
+      await pool.query(`
         INSERT INTO transactions (userId, type, amount, status, description, reference)
-        VALUES (?, 'trade', ?, 'completed', 'Admin balance adjustment', ?)
-      `, userId, Math.abs(diff), generateReference());
+        VALUES ($1, 'trade', $2, 'completed', 'Admin balance adjustment', $3)
+      `, [userId, Math.abs(diff), generateReference()]);
     }
 
     log('info', `Balance updated for user ${userRow.email}: $${previousBalance} -> $${balance}`);
@@ -2902,21 +2828,23 @@ app.get('/api/admin/transactions', authMiddleware, adminMiddleware, async (req, 
     let query = 'SELECT * FROM transactions';
     const params = [];
     const conditions = [];
+    let paramIndex = 1;
 
-    if (type) { conditions.push('type = ?'); params.push(type); }
-    if (status) { conditions.push('status = ?'); params.push(status); }
+    if (type) { conditions.push(`type = $${paramIndex}`); params.push(type); paramIndex++; }
+    if (status) { conditions.push(`status = $${paramIndex}`); params.push(status); paramIndex++; }
 
     if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
-    query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
+    query += ` ORDER BY createdAt DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     params.push(parseInt(limit), parseInt(offset));
 
-    const rows = await db.allAsync(query, ...params);
-    const transactions = rows.map(rowToTransaction);
+    const rowsRes = await pool.query(query, params);
+    const transactions = rowsRes.rows.map(rowToTransaction);
 
     let countQuery = 'SELECT COUNT(*) as total FROM transactions';
     if (conditions.length > 0) countQuery += ' WHERE ' + conditions.join(' AND ');
-    const totalRow = await db.getAsync(countQuery, ...params.slice(0, -2));
-    const total = totalRow ? totalRow.total : 0;
+    const countParams = params.slice(0, -2);
+    const countRes = await pool.query(countQuery, countParams);
+    const total = parseInt(countRes.rows[0].total);
 
     res.json({ transactions, pagination: { total, limit: parseInt(limit), offset: parseInt(offset) } });
   } catch (error) {
@@ -2947,71 +2875,70 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
             return res.status(400).json({ error: 'Invalid reset action.' });
         }
 
-        // Use manual transaction with rollback on error
-        await db.execAsync('BEGIN TRANSACTION');
+        // Use transaction (PostgreSQL doesn't have BEGIN/COMMIT in same way; we'll use SAVEPOINT or rely on atomic queries)
+        // Simpler: run queries sequentially and rollback if error via a client session – we use a transaction block.
+        const client = await pool.connect();
         try {
+            await client.query('BEGIN');
             switch (action) {
                 case 'balance':
-                    await db.runAsync(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                    await client.query('UPDATE users SET balance = 50, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1', [userId]);
                     break;
                 case 'plan':
-                    await db.runAsync(`UPDATE users SET selectedPlan = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                    await client.query('UPDATE users SET selectedPlan = NULL, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1', [userId]);
                     break;
                 case 'holdings':
-                    await db.runAsync(`DELETE FROM holdings WHERE userId = ?`, userId);
+                    await client.query('DELETE FROM holdings WHERE userId = $1', [userId]);
                     break;
                 case 'transactions':
-                    await db.runAsync(`DELETE FROM transactions WHERE userId = ?`, userId);
+                    await client.query('DELETE FROM transactions WHERE userId = $1', [userId]);
                     const bonusRef = generateReference();
-                    await db.runAsync(`
+                    await client.query(`
                         INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
-                        VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
-                    `, userId, bonusRef);
-                    await db.runAsync(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                        VALUES ($1, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', $2, EXTRACT(EPOCH FROM NOW()), EXTRACT(EPOCH FROM NOW()))
+                    `, [userId, bonusRef]);
+                    await client.query('UPDATE users SET balance = 50, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1', [userId]);
                     break;
                 case 'profile':
-                    await db.runAsync(`
-                        UPDATE users SET profilePicture = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?
-                    `, userId);
+                    await client.query('UPDATE users SET profilePicture = NULL, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1', [userId]);
                     break;
                 case 'all':
-                    await db.runAsync(`DELETE FROM holdings WHERE userId = ?`, userId);
-                    await db.runAsync(`DELETE FROM transactions WHERE userId = ?`, userId);
+                    await client.query('DELETE FROM holdings WHERE userId = $1', [userId]);
+                    await client.query('DELETE FROM transactions WHERE userId = $1', [userId]);
                     const allBonusRef = generateReference();
-                    await db.runAsync(`
+                    await client.query(`
                         INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
-                        VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
-                    `, userId, allBonusRef);
-                    await db.runAsync(`
-                        UPDATE users SET balance = 50, selectedPlan = NULL, profilePicture = NULL, updatedAt = strftime('%s', 'now')
-                        WHERE id = ?
-                    `, userId);
+                        VALUES ($1, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', $2, EXTRACT(EPOCH FROM NOW()), EXTRACT(EPOCH FROM NOW()))
+                    `, [userId, allBonusRef]);
+                    await client.query('UPDATE users SET balance = 50, selectedPlan = NULL, profilePicture = NULL, updatedAt = EXTRACT(EPOCH FROM NOW()) WHERE id = $1', [userId]);
                     break;
                 default:
                     throw new Error('Invalid action');
             }
-            await db.execAsync('COMMIT');
+            await client.query('COMMIT');
         } catch (innerError) {
-            await db.execAsync('ROLLBACK');
+            await client.query('ROLLBACK');
             throw innerError;
+        } finally {
+            client.release();
         }
 
-        const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', userId);
-        if (!userRow) {
+        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+        if (userRes.rows.length === 0) {
             return res.status(404).json({ error: 'User not found after reset.' });
         }
-        const user = rowToUser(userRow);
+        const user = rowToUser(userRes.rows[0]);
         delete user.password;
         delete user.verificationCode;
         delete user.verificationCodeExpires;
 
-        const transactions = await db.allAsync('SELECT * FROM transactions WHERE userId = ? ORDER BY createdAt DESC', userId);
+        const transactionsRes = await pool.query('SELECT * FROM transactions WHERE userId = $1 ORDER BY createdAt DESC', [userId]);
 
         log('info', `User ${userId} reset ${action}`);
         res.json({
             message: `Reset "${action}" successful.`,
             user,
-            transactions: transactions.map(rowToTransaction),
+            transactions: transactionsRes.rows.map(rowToTransaction),
         });
     } catch (error) {
         log('error', 'Reset error', error);
@@ -3022,14 +2949,14 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
 app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const userId = req.params.id;
-    const userRow = await db.getAsync('SELECT id, email FROM users WHERE id = ?', userId);
-    if (!userRow) return res.status(404).json({ error: 'User not found.' });
+    const userRes = await pool.query('SELECT id, email FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
     if (parseInt(userId) === req.user.id) {
       return res.status(400).json({ error: 'Cannot delete your own account.' });
     }
 
-    await db.runAsync('DELETE FROM users WHERE id = ?', userId);
-    log('info', `User deleted: ${userRow.email} (ID: ${userId})`);
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    log('info', `User deleted: ${userRes.rows[0].email} (ID: ${userId})`);
     res.json({ message: 'User deleted successfully.' });
   } catch (error) {
     log('error', 'Delete user error', error);
@@ -3060,7 +2987,6 @@ app.use((err, req, res, next) => {
 // ================================================================
 const PORT = process.env.PORT || 5000;
 
-// Initialize database and seed admin, then start server
 (async function start() {
   try {
     await initDatabase();
