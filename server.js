@@ -104,11 +104,11 @@ app.use(rateLimiter);
 const db = new sqlite3.Database(process.env.DATABASE_PATH || 'database.sqlite');
 db.run('PRAGMA foreign_keys = ON');
 
-// Promisify key methods
+// After db initialization
 db.getAsync = promisify(db.get).bind(db);
 db.allAsync = promisify(db.all).bind(db);
 
-// Custom runAsync that returns an object with lastInsertRowid
+// Custom runAsync that returns { lastInsertRowid, changes }
 db.runAsync = function(sql, ...params) {
   return new Promise((resolve, reject) => {
     this.run(sql, params, function(err) {
@@ -1171,24 +1171,28 @@ app.post('/api/auth/register', async (req, res) => {
       VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?)
     `, userId, generateReference());
 
-    await sendVerificationEmail(email, verificationCode);
+    // --- Email sending (now wrapped) ---
+    try {
+      await sendVerificationEmail(email, verificationCode);
+    } catch (emailError) {
+      // Log the error but do NOT fail the registration
+      console.error('⚠️ Email could not be sent:', emailError.message);
+      // Optionally, you can store the error in a log table, but we just log it.
+    }
 
     log('info', `New user registered: ${email} (ID: ${userId})`);
     res.status(201).json({
       message: 'Registration successful. Check your email for verification code. You received $50 signup bonus!',
       userId: userId,
     });
-  }catch (error) {
-  console.error('🔥 Registration error:', error);
-  console.error('🔥 Stack:', error?.stack);
-  log('error', 'Registration error', {
-    message: error?.message || String(error),
-    stack: error?.stack,
-    name: error?.name,
-    code: error?.code
-  });
-  res.status(500).json({ error: 'Server error during registration.' });
-}
+  } catch (error) {
+    console.error('🔥 Registration error:', error);
+    log('error', 'Registration error', {
+      message: error?.message || String(error),
+      stack: error?.stack,
+    });
+    res.status(500).json({ error: 'Server error during registration.' });
+  }
 });
 
 app.post('/api/auth/verify', async (req, res) => {
