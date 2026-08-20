@@ -4,7 +4,7 @@
   "description": "Nexus AI Trading Platform Backend",
   "main": "server.js",
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   },
   "scripts": {
     "start": "node server.js"
@@ -21,5 +21,14 @@
     "mongoose": "^9.9.2",
     "multer": "^2.2.0",
     "nodemailer": "^9.0.5"
+  },
+  "overrides": {
+    "better-sqlite3": {
+      "binary": {
+        "module_name": "better_sqlite3",
+        "module_path": "build/Release",
+        "host": "https://github.com/WiseLibs/better-sqlite3/releases/download/v13.0.3/"
+      }
+    }
   }
 }
