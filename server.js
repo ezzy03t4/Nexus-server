@@ -449,12 +449,12 @@ const PLAN_ORDER = {
 
 // Serve the dashboard page
 app.get('/dashboard', (req, res) => {
-    res.sendFile(path.join(__dirname, 'Dashboard/index.html'));
+    res.sendFile(path.join(__dirname, 'https://nexusai-tranding.vercel.app/dashboard/'));
 });
 
 // Serve the main page
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+    res.sendFile(path.join(__dirname, 'https://nexusai-tranding.vercel.app/'));
 });
 
 // Keep PLAN_PRICES for backward compatibility
