@@ -4,7 +4,7 @@
   "description": "Nexus AI Trading Platform Backend",
   "main": "server.js",
   "engines": {
-    "node": "20.x"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node server.js"
