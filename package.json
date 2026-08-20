@@ -7,13 +7,11 @@
     "node": "20.x"
   },
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npm rebuild better-sqlite3 --build-from-source"
+    "start": "node server.js"
   },
   "dependencies": {
     "axios": "^1.19.0",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^13.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -21,6 +19,7 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.9.2",
     "multer": "^2.2.0",
-    "nodemailer": "^9.0.5"
+    "nodemailer": "^9.0.5",
+    "sqlite3": "^5.1.7"
   }
 }
