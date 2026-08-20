@@ -107,7 +107,17 @@ db.run('PRAGMA foreign_keys = ON');
 // Promisify key methods
 db.getAsync = promisify(db.get).bind(db);
 db.allAsync = promisify(db.all).bind(db);
-db.runAsync = promisify(db.run).bind(db);
+
+// Custom runAsync that returns an object with lastInsertRowid
+db.runAsync = function(sql, ...params) {
+  return new Promise((resolve, reject) => {
+    this.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve({ lastInsertRowid: this.lastID, changes: this.changes });
+    });
+  });
+};
+
 db.execAsync = promisify(db.exec).bind(db);
 
 // ================================================================
@@ -1169,8 +1179,8 @@ app.post('/api/auth/register', async (req, res) => {
       userId: userId,
     });
   }catch (error) {
-  console.error('🔥 Registration error details:', error);
-  console.error('🔥 Stack trace:', error?.stack);
+  console.error('🔥 Registration error:', error);
+  console.error('🔥 Stack:', error?.stack);
   log('error', 'Registration error', {
     message: error?.message || String(error),
     stack: error?.stack,
