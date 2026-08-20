@@ -304,7 +304,8 @@ async function initDatabase() {
     { name: 'verificationCodeExpires', type: 'INTEGER' }
   ];
   for (const col of userColumnsToAdd) {
-    if (!existingUserCols.includes(col.name)) {
+    // Case-insensitive check
+    if (!existingUserCols.some(c => c.toLowerCase() === col.name.toLowerCase())) {
       console.log(`🔄 Adding ${col.name} column to users...`);
       await db.execAsync(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
       console.log(`✅ ${col.name} column added.`);
@@ -331,7 +332,7 @@ async function initDatabase() {
     { name: 'feeAmount', type: 'REAL DEFAULT 0' }
   ];
   for (const col of txColumnsToAdd) {
-    if (!existingTxCols.includes(col.name)) {
+    if (!existingTxCols.some(c => c.toLowerCase() === col.name.toLowerCase())) {
       console.log(`🔄 Adding ${col.name} column to transactions...`);
       await db.execAsync(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
       console.log(`✅ ${col.name} column added.`);
@@ -351,7 +352,7 @@ async function initDatabase() {
     { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
   ];
   for (const col of supportColumnsToAdd) {
-    if (!existingSupportCols.includes(col.name)) {
+    if (!existingSupportCols.some(c => c.toLowerCase() === col.name.toLowerCase())) {
       console.log(`🔄 Adding ${col.name} column to support_tickets...`);
       await db.execAsync(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
       console.log(`✅ ${col.name} column added.`);
@@ -359,6 +360,7 @@ async function initDatabase() {
   }
   await db.execAsync(`UPDATE support_tickets SET updatedAt = EXTRACT(EPOCH FROM NOW())::INT WHERE updatedAt IS NULL OR updatedAt = 0`);
 
+  // (Optional) Recreate transactions check constraint for plan_purchase – already included in CREATE TABLE, so skip.
   console.log('✅ Database schema and migrations applied.');
 }
 
