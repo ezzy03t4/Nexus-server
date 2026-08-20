@@ -8,7 +8,8 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
-const Database = require('better-sqlite3');
+const sqlite3 = require('sqlite3').verbose();
+const { promisify } = require('util');
 const axios = require('axios');
 const multer = require('multer');
 const path = require('path');
@@ -18,26 +19,22 @@ const fs = require('fs');
 // EXPRESS APP
 // ================================================================
 const app = express();
-// Allow multiple origins (including your local Live Server)
 const allowedOrigins = [
   'http://127.0.0.1:5500',
   'http://localhost:5500',
   'http://localhost:5000',
   process.env.FRONTEND_URL
-].filter(Boolean); // remove undefined
+].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
     if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
     }
-  },
-  // If you need credentials (cookies), uncomment:
-  // credentials: true
+  }
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -58,7 +55,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (allowed.includes(file.mimetype)) cb(null, true);
@@ -76,23 +73,19 @@ const RATE_LIMIT_MAX = 100;
 const rateLimiter = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress;
   const now = Date.now();
-
   if (!rateLimits[ip]) {
     rateLimits[ip] = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
     return next();
   }
-
   if (now > rateLimits[ip].resetTime) {
     rateLimits[ip].count = 1;
     rateLimits[ip].resetTime = now + RATE_LIMIT_WINDOW;
     return next();
   }
-
   rateLimits[ip].count++;
   if (rateLimits[ip].count > RATE_LIMIT_MAX) {
     return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
-
   next();
 };
 
@@ -106,153 +99,48 @@ setInterval(() => {
 app.use(rateLimiter);
 
 // ================================================================
-// SQLITE DATABASE (with full schema and migrations)
+// SQLITE DATABASE (with full schema and migrations) - using sqlite3
 // ================================================================
-const db = new Database(process.env.DATABASE_PATH || 'database.sqlite');
-db.pragma('foreign_keys = ON');
+const db = new sqlite3.Database(process.env.DATABASE_PATH || 'database.sqlite');
+db.run('PRAGMA foreign_keys = ON');
 
-// Users table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password TEXT NOT NULL,
-    country TEXT NOT NULL,
-    phone TEXT DEFAULT '',
-    selectedPlan TEXT DEFAULT NULL,
-    balance REAL DEFAULT 0,
-    profilePicture TEXT DEFAULT NULL,
-    isAdmin INTEGER DEFAULT 0,
-    blocked INTEGER DEFAULT 0,
-    verified INTEGER DEFAULT 0,
-    verificationCode TEXT DEFAULT NULL,
-    verificationCodeExpires INTEGER DEFAULT NULL,
-    createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-    updatedAt INTEGER DEFAULT (strftime('%s', 'now'))
-  )
-`);
-
-// Transactions table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
-    amount REAL NOT NULL,
-    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
-    method TEXT DEFAULT NULL,
-    description TEXT DEFAULT '',
-    reference TEXT DEFAULT NULL,
-    proof TEXT DEFAULT NULL,
-    createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-    updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-    completedAt INTEGER DEFAULT NULL,
-    FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
+// Promisify key methods
+db.getAsync = promisify(db.get).bind(db);
+db.allAsync = promisify(db.all).bind(db);
+db.runAsync = promisify(db.run).bind(db);
+db.execAsync = promisify(db.exec).bind(db);
 
 // ================================================================
-// NOTIFICATIONS TABLE
+// INITIALIZE DATABASE (migrations) — fully async
 // ================================================================
-db.exec(`
-  CREATE TABLE IF NOT EXISTS notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    message TEXT NOT NULL,
-    type TEXT DEFAULT 'info',
-    isRead INTEGER DEFAULT 0,
-    createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-    FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
+async function initDatabase() {
+  console.log('🔄 Running database schema migrations...');
 
-// Sessions table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    token TEXT NOT NULL UNIQUE,
-    expiresAt INTEGER NOT NULL,
-    createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-    FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
+  // Users table
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password TEXT NOT NULL,
+      country TEXT NOT NULL,
+      phone TEXT DEFAULT '',
+      selectedPlan TEXT DEFAULT NULL,
+      balance REAL DEFAULT 0,
+      profilePicture TEXT DEFAULT NULL,
+      isAdmin INTEGER DEFAULT 0,
+      blocked INTEGER DEFAULT 0,
+      verified INTEGER DEFAULT 0,
+      verificationCode TEXT DEFAULT NULL,
+      verificationCodeExpires INTEGER DEFAULT NULL,
+      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+      updatedAt INTEGER DEFAULT (strftime('%s', 'now'))
+    )
+  `);
+  console.log('✅ Users table ready');
 
-// ================================================================
-// DAILY USAGE TABLE (for refresh limits)
-// ================================================================
-db.exec(`
-  CREATE TABLE IF NOT EXISTS daily_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    date TEXT NOT NULL,  -- YYYY-MM-DD
-    action TEXT NOT NULL,
-    count INTEGER DEFAULT 0,
-    UNIQUE(userId, date, action),
-    FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
-
-// ================================================================
-// MIGRATIONS – ensure all columns exist
-// ================================================================
-
-// -- Users table migrations --
-const userTableInfo = db.prepare("PRAGMA table_info(users)").all();
-const userColumnsToAdd = [
-  { name: 'profilePicture', type: 'TEXT DEFAULT NULL' },
-  { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-  { name: 'selectedPlan', type: 'TEXT DEFAULT NULL' },
-  { name: 'balance', type: 'REAL DEFAULT 0' },
-  { name: 'isAdmin', type: 'INTEGER DEFAULT 0' },
-  { name: 'blocked', type: 'INTEGER DEFAULT 0' },
-  { name: 'verified', type: 'INTEGER DEFAULT 0' },
-  { name: 'verificationCode', type: 'TEXT DEFAULT NULL' },
-  { name: 'verificationCodeExpires', type: 'INTEGER DEFAULT NULL' }
-];
-for (const col of userColumnsToAdd) {
-  const exists = userTableInfo.some(c => c.name === col.name);
-  if (!exists) {
-    console.log(`🔄 Adding ${col.name} column to users...`);
-    db.exec(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
-    console.log(`✅ ${col.name} column added.`);
-  }
-}
-db.exec('UPDATE users SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-// Add currency columns to transactions table
-const txTableInfo = db.prepare("PRAGMA table_info(transactions)").all();
-const txColumnsToAdd = [
-    { name: 'proof', type: 'TEXT DEFAULT NULL' },
-    { name: 'description', type: 'TEXT DEFAULT ""' },
-    { name: 'completedAt', type: 'INTEGER DEFAULT NULL' },
-    { name: 'method', type: 'TEXT DEFAULT NULL' },
-    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
-    { name: 'currency', type: 'TEXT DEFAULT "USD"' },
-    { name: 'originalAmount', type: 'REAL DEFAULT 0' },
-    { name: 'exchangeRate', type: 'REAL DEFAULT 1' },
-    { name: 'feePercent', type: 'REAL DEFAULT 0' },
-    { name: 'feeAmount', type: 'REAL DEFAULT 0' }
-];
-for (const col of txColumnsToAdd) {
-    const exists = txTableInfo.some(c => c.name === col.name);
-    if (!exists) {
-        console.log(`🔄 Adding ${col.name} column to transactions...`);
-        db.exec(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
-        console.log(`✅ ${col.name} column added.`);
-    }
-}
-db.exec('UPDATE transactions SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
-
-// -- Fix transactions CHECK constraint to include 'plan_purchase' --
-const txCreateSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get();
-if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
-  console.log('🔄 Recreating transactions table to add plan_purchase to CHECK constraint...');
-  db.exec('BEGIN TRANSACTION');
-  db.exec(`
-    CREATE TABLE transactions_new (
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       userId INTEGER NOT NULL,
       type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
@@ -268,105 +156,185 @@ if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
       FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
-  db.exec(`
-    INSERT INTO transactions_new (
-      id, userId, type, amount, status, method, description,
-      reference, proof, createdAt, updatedAt, completedAt
+  console.log('✅ Transactions table ready');
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      type TEXT DEFAULT 'info',
+      isRead INTEGER DEFAULT 0,
+      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
     )
-    SELECT
-      id, userId, type, amount, status, method, description,
-      reference, proof, createdAt, updatedAt, completedAt
-    FROM transactions
   `);
-  db.exec('DROP TABLE transactions');
-  db.exec('ALTER TABLE transactions_new RENAME TO transactions');
-  db.exec('COMMIT');
-  console.log('✅ transactions table recreated with updated CHECK constraint.');
-}
+  console.log('✅ Notifications table ready');
 
-// ===== HOLDINGS TABLE =====
-function ensureHoldingsTable() {
-  const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='holdings'").get();
-  if (!tableExists) {
-    console.log('🔄 Creating holdings table...');
-    db.exec(`
-      CREATE TABLE holdings (
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      token TEXT NOT NULL UNIQUE,
+      expiresAt INTEGER NOT NULL,
+      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  console.log('✅ Sessions table ready');
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS daily_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      date TEXT NOT NULL,
+      action TEXT NOT NULL,
+      count INTEGER DEFAULT 0,
+      UNIQUE(userId, date, action),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  console.log('✅ Daily usage table ready');
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS holdings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      symbol TEXT NOT NULL,
+      amount REAL NOT NULL,
+      averagePrice REAL NOT NULL,
+      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE(userId, symbol)
+    )
+  `);
+  console.log('✅ Holdings table ready');
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      subject TEXT NOT NULL,
+      category TEXT NOT NULL,
+      priority TEXT NOT NULL,
+      message TEXT NOT NULL,
+      attachment TEXT DEFAULT NULL,
+      status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
+      adminReply TEXT DEFAULT NULL,
+      createdAt INTEGER DEFAULT (strftime('%s', 'now')),
+      updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  console.log('✅ Support tickets table ready');
+
+  // ---- Migrations: ensure all columns exist ----
+  // Users
+  const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
+  const existingUserCols = userTableInfo.map(c => c.name);
+  const userColumnsToAdd = [
+    { name: 'profilePicture', type: 'TEXT DEFAULT NULL' },
+    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
+    { name: 'selectedPlan', type: 'TEXT DEFAULT NULL' },
+    { name: 'balance', type: 'REAL DEFAULT 0' },
+    { name: 'isAdmin', type: 'INTEGER DEFAULT 0' },
+    { name: 'blocked', type: 'INTEGER DEFAULT 0' },
+    { name: 'verified', type: 'INTEGER DEFAULT 0' },
+    { name: 'verificationCode', type: 'TEXT DEFAULT NULL' },
+    { name: 'verificationCodeExpires', type: 'INTEGER DEFAULT NULL' }
+  ];
+  for (const col of userColumnsToAdd) {
+    if (!existingUserCols.includes(col.name)) {
+      console.log(`🔄 Adding ${col.name} column to users...`);
+      await db.execAsync(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
+      console.log(`✅ ${col.name} column added.`);
+    }
+  }
+  await db.execAsync('UPDATE users SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+
+  // Transactions
+  const txTableInfo = await db.allAsync("PRAGMA table_info(transactions)");
+  const existingTxCols = txTableInfo.map(c => c.name);
+  const txColumnsToAdd = [
+    { name: 'proof', type: 'TEXT DEFAULT NULL' },
+    { name: 'description', type: 'TEXT DEFAULT ""' },
+    { name: 'completedAt', type: 'INTEGER DEFAULT NULL' },
+    { name: 'method', type: 'TEXT DEFAULT NULL' },
+    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' },
+    { name: 'currency', type: 'TEXT DEFAULT "USD"' },
+    { name: 'originalAmount', type: 'REAL DEFAULT 0' },
+    { name: 'exchangeRate', type: 'REAL DEFAULT 1' },
+    { name: 'feePercent', type: 'REAL DEFAULT 0' },
+    { name: 'feeAmount', type: 'REAL DEFAULT 0' }
+  ];
+  for (const col of txColumnsToAdd) {
+    if (!existingTxCols.includes(col.name)) {
+      console.log(`🔄 Adding ${col.name} column to transactions...`);
+      await db.execAsync(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
+      console.log(`✅ ${col.name} column added.`);
+    }
+  }
+  await db.execAsync('UPDATE transactions SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+
+  // Fix transactions CHECK constraint to include 'plan_purchase'
+  const txCreateSql = await db.getAsync("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'");
+  if (txCreateSql && !txCreateSql.sql.includes("'plan_purchase'")) {
+    console.log('🔄 Recreating transactions table to add plan_purchase...');
+    await db.execAsync('BEGIN TRANSACTION');
+    await db.execAsync(`
+      CREATE TABLE transactions_new (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         userId INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'trade', 'bonus', 'plan_purchase')),
         amount REAL NOT NULL,
-        averagePrice REAL NOT NULL,
+        status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed', 'cancelled', 'processing')),
+        method TEXT DEFAULT NULL,
+        description TEXT DEFAULT '',
+        reference TEXT DEFAULT NULL,
+        proof TEXT DEFAULT NULL,
         createdAt INTEGER DEFAULT (strftime('%s', 'now')),
         updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
-        UNIQUE(userId, symbol)
+        completedAt INTEGER DEFAULT NULL,
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
       )
     `);
-    console.log('✅ Holdings table created.');
-    return;
-  }
-
-  const colInfo = db.prepare("PRAGMA table_info(holdings)").all();
-  const hasAvgPrice = colInfo.some(c => c.name === 'averagePrice');
-  const hasUpdatedAtH = colInfo.some(c => c.name === 'updatedAt');
-
-  if (!hasAvgPrice || !hasUpdatedAtH) {
-    console.log('⚠️ Holdings table missing columns, recreating...');
-    db.exec('DROP TABLE holdings');
-    db.exec(`
-      CREATE TABLE holdings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        userId INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        amount REAL NOT NULL,
-        averagePrice REAL NOT NULL,
-        createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-        updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
-        UNIQUE(userId, symbol)
+    await db.execAsync(`
+      INSERT INTO transactions_new (
+        id, userId, type, amount, status, method, description,
+        reference, proof, createdAt, updatedAt, completedAt
       )
+      SELECT
+        id, userId, type, amount, status, method, description,
+        reference, proof, createdAt, updatedAt, completedAt
+      FROM transactions
     `);
-    console.log('✅ Holdings table recreated with correct schema.');
+    await db.execAsync('DROP TABLE transactions');
+    await db.execAsync('ALTER TABLE transactions_new RENAME TO transactions');
+    await db.execAsync('COMMIT');
+    console.log('✅ transactions table recreated with updated CHECK constraint.');
   }
-}
-ensureHoldingsTable();
 
-// ================================================================
-// SUPPORT TICKETS TABLE
-// ================================================================
-db.exec(`
-  CREATE TABLE IF NOT EXISTS support_tickets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER NOT NULL,
-    subject TEXT NOT NULL,
-    category TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    message TEXT NOT NULL,
-    attachment TEXT DEFAULT NULL,
-    status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
-    adminReply TEXT DEFAULT NULL,
-    createdAt INTEGER DEFAULT (strftime('%s', 'now')),
-    updatedAt INTEGER DEFAULT (strftime('%s', 'now')),
-    FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
-
-// Migrations for support_tickets
-const supportTableInfo = db.prepare("PRAGMA table_info(support_tickets)").all();
-const supportColumnsToAdd = [
-  { name: 'attachment', type: 'TEXT DEFAULT NULL' },
-  { name: 'adminReply', type: 'TEXT DEFAULT NULL' },
-  { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
-];
-for (const col of supportColumnsToAdd) {
-  const exists = supportTableInfo.some(c => c.name === col.name);
-  if (!exists) {
-    console.log(`🔄 Adding ${col.name} column to support_tickets...`);
-    db.exec(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
-    console.log(`✅ ${col.name} column added.`);
+  // Support tickets
+  const supportTableInfo = await db.allAsync("PRAGMA table_info(support_tickets)");
+  const existingSupportCols = supportTableInfo.map(c => c.name);
+  const supportColumnsToAdd = [
+    { name: 'attachment', type: 'TEXT DEFAULT NULL' },
+    { name: 'adminReply', type: 'TEXT DEFAULT NULL' },
+    { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
+  ];
+  for (const col of supportColumnsToAdd) {
+    if (!existingSupportCols.includes(col.name)) {
+      console.log(`🔄 Adding ${col.name} column to support_tickets...`);
+      await db.execAsync(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
+      console.log(`✅ ${col.name} column added.`);
+    }
   }
+  await db.execAsync('UPDATE support_tickets SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
+
+  console.log('✅ Database schema and migrations applied.');
 }
-db.exec('UPDATE support_tickets SET updatedAt = createdAt WHERE updatedAt IS NULL OR updatedAt = 0');
 
 // ================================================================
 // HELPERS
@@ -437,7 +405,6 @@ const PLAN_CONFIG = {
   Titan:     { price: 15000,maxTrade: 1000000,refreshLimit: 999999, cashbackPercent: 40}
 };
 
-// Plan order for upgrade/downgrade checks
 const PLAN_ORDER = {
   Starter: 1,
   Basic: 2,
@@ -447,48 +414,45 @@ const PLAN_ORDER = {
   Titan: 6
 };
 
-// Serve the dashboard page
+// Serve the dashboard page (redirect to hosted frontend)
 app.get('/dashboard', (req, res) => {
-    res.sendFile(path.join(__dirname, 'https://nexusai-tranding.vercel.app/dashboard/'));
+    res.redirect('https://nexusai-tranding.vercel.app/dashboard/');
 });
 
-// Serve the main page
+// Serve the main page (redirect to hosted frontend)
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'https://nexusai-tranding.vercel.app/'));
+    res.redirect('https://nexusai-tranding.vercel.app/');
 });
 
-// Keep PLAN_PRICES for backward compatibility
 const PLAN_PRICES = Object.fromEntries(
   Object.entries(PLAN_CONFIG).map(([name, cfg]) => [name, cfg.price])
 );
 
 // ---- Daily usage helpers ----
 function getTodayDate() {
-  return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  return new Date().toISOString().split('T')[0];
 }
 
-function getDailyUsage(userId, action, date) {
-  const row = db.prepare('SELECT count FROM daily_usage WHERE userId = ? AND date = ? AND action = ?')
-    .get(userId, date, action);
+async function getDailyUsage(userId, action, date) {
+  const row = await db.getAsync('SELECT count FROM daily_usage WHERE userId = ? AND date = ? AND action = ?', userId, date, action);
   return row ? row.count : 0;
 }
 
-function incrementDailyUsage(userId, action, date) {
-  const stmt = db.prepare(`
+async function incrementDailyUsage(userId, action, date) {
+  await db.runAsync(`
     INSERT INTO daily_usage (userId, date, action, count)
     VALUES (?, ?, ?, 1)
     ON CONFLICT(userId, date, action) DO UPDATE SET count = count + 1
-  `);
-  stmt.run(userId, date, action);
+  `, userId, date, action);
 }
 
-function checkAndIncrementDailyLimit(userId, action, limit) {
+async function checkAndIncrementDailyLimit(userId, action, limit) {
   const date = getTodayDate();
-  const used = getDailyUsage(userId, action, date);
+  const used = await getDailyUsage(userId, action, date);
   if (used >= limit) {
     return { allowed: false, used, limit };
   }
-  incrementDailyUsage(userId, action, date);
+  await incrementDailyUsage(userId, action, date);
   return { allowed: true, used: used + 1, limit };
 }
 
@@ -515,11 +479,10 @@ const SUPPORTED_SYMBOLS = Object.keys(COINGECKO_IDS);
 // ================================================================
 const EXCHANGE_RATE_API = 'https://api.exchangerate-api.com/v4/latest/USD';
 const RATE_CACHE = {};
-const RATE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const RATE_CACHE_TTL = 10 * 60 * 1000;
 
 async function getExchangeRates() {
     const now = Date.now();
-    // Check cache
     if (RATE_CACHE.timestamp && (now - RATE_CACHE.timestamp < RATE_CACHE_TTL)) {
         return RATE_CACHE.rates;
     }
@@ -533,13 +496,11 @@ async function getExchangeRates() {
         return data.rates;
     } catch (error) {
         console.error('[Exchange] Failed to fetch rates:', error.message);
-        // Return cached rates if available, otherwise fallback
         if (RATE_CACHE.rates) {
             console.warn('[Exchange] Using stale rates');
             return RATE_CACHE.rates;
         }
-        // Fallback rates (approx)
-        return { USD: 1, ZAR: 19.2, PHP: 70};
+        return { USD: 1, ZAR: 19.2, PHP: 70 };
     }
 }
 
@@ -548,7 +509,7 @@ async function getExchangeRates() {
 // ================================================================
 const COINGECKO_API = 'https://api.coingecko.com/api/v3/simple/price';
 const PRICE_CACHE = {};
-const CACHE_TTL = 30 * 1000; // 30 seconds
+const CACHE_TTL = 30 * 1000;
 
 async function getCryptoPrices(symbols) {
   if (!symbols || symbols.length === 0) return {};
@@ -575,7 +536,6 @@ async function getCryptoPrices(symbols) {
     const apiKey = process.env.COINGECKO_API_KEY;
     const url = `${COINGECKO_API}?ids=${ids}&vs_currencies=usd`;
     
-    // Build headers with API key if available
     const headers = {};
     if (apiKey) {
       headers['x-cg-demo-api-key'] = apiKey;
@@ -600,13 +560,11 @@ async function getCryptoPrices(symbols) {
     console.log(`[price] Fetched fresh prices for ${cacheKey}`);
     return result;
   } catch (error) {
-    // ---- If we have cached data (even stale), return it ----
     if (PRICE_CACHE[cacheKey]) {
       console.warn(`[price] API failed, using stale cache for ${cacheKey}`);
       return PRICE_CACHE[cacheKey].prices;
     }
 
-    // ---- If it's a 429 rate limit, wait and retry once ----
     if (error.response && error.response.status === 429) {
       console.warn('[price] Rate limit hit, waiting 2s and retrying...');
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -618,7 +576,6 @@ async function getCryptoPrices(symbols) {
 
         const apiKey = process.env.COINGECKO_API_KEY;
         const url = `${COINGECKO_API}?ids=${ids}&vs_currencies=usd`;
-        
         const headers = {};
         if (apiKey) {
           headers['x-cg-demo-api-key'] = apiKey;
@@ -640,18 +597,15 @@ async function getCryptoPrices(symbols) {
         return result;
       } catch (retryError) {
         console.error('[price] Retry failed, returning empty (or stale if available)');
-        // If we have cached data (even stale) after retry failure, return it
         if (PRICE_CACHE[cacheKey]) {
           console.warn(`[price] Using stale cache after retry failure for ${cacheKey}`);
           return PRICE_CACHE[cacheKey].prices;
         }
-        // No cache, return empty
         log('error', 'Price fetch failed after retry', { message: retryError.message });
         return {};
       }
     }
 
-    // ---- Any other error: log and return empty ----
     log('error', 'Failed to fetch crypto prices', { message: error.message });
     return {};
   }
@@ -663,14 +617,14 @@ async function getCryptoPrices(symbols) {
 (async function seedAdmin() {
   const adminEmail = 'admin@nexus.com';
   const adminPassword = 'Admin123!';
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(adminEmail);
+  const existing = await db.getAsync('SELECT id FROM users WHERE email = ?', adminEmail);
   if (!existing) {
     const salt = await bcrypt.genSalt(10);
     const hashed = await bcrypt.hash(adminPassword, salt);
-    db.prepare(`
+    await db.runAsync(`
       INSERT INTO users (name, email, password, country, isAdmin, verified, balance)
       VALUES ('Admin', ?, ?, 'Global', 1, 1, 0)
-    `).run(adminEmail, hashed);
+    `, adminEmail, hashed);
     console.log('✅ Default admin created: admin@nexus.com / Admin123!');
   }
 })();
@@ -791,18 +745,12 @@ app.get('/api/convert', async (req, res) => {
 // ================================================================
 // EMAIL UTILITY
 // ================================================================
-// Replace your current transporter with this:
-
-// Brevo API key from environment
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
-// ✅ API-based transporter – mimics nodemailer's sendMail()
 const transporter = {
   sendMail: async (mailOptions) => {
     try {
       const { from, to, subject, html } = mailOptions;
-      
-      // Use the sender from mailOptions, or fallback to your verified email
       const senderEmail = from || process.env.EMAIL_USER || 'nexusai58@gmail.com';
 
       const response = await axios.post(
@@ -829,10 +777,7 @@ const transporter = {
   }
 };
 
-// Optional: add a `verify` method for compatibility
 transporter.verify = function (callback) {
-  // The API doesn't have a "verify" endpoint, but we can test by sending a test email
-  // For simplicity, just call the callback with no error.
   if (callback) callback(null, true);
   return Promise.resolve(true);
 };
@@ -881,7 +826,6 @@ const sendPasswordResetEmail = async (email, code) => {
   log('info', `Password reset email sent to ${email}`);
 };
 
-// --- Deposit notification ---
 const sendDepositNotificationEmail = async (userEmail, userName, transaction, proofDataOrPath = null) => {
   const methodNames = {
     bank: 'Bank Transfer',
@@ -968,7 +912,6 @@ const sendDepositNotificationEmail = async (userEmail, userName, transaction, pr
   log('info', `Deposit notification email sent to admin for user ${userEmail}`);
 };
 
-// --- Deposit proof email (separate, if proof uploaded later) ---
 const sendDepositProofEmail = async (userEmail, userName, transaction, proofDataOrPath) => {
   const methodNames = {
     bank: 'Bank Transfer',
@@ -1053,7 +996,6 @@ const sendDepositProofEmail = async (userEmail, userName, transaction, proofData
   log('info', `Deposit proof email sent for user ${userEmail}`);
 };
 
-// --- WITHDRAWAL NOTIFICATION EMAIL (NEW) ---
 const sendWithdrawalNotificationEmail = async (userEmail, userName, transaction) => {
   const methodNames = {
     bank: 'Bank Transfer',
@@ -1086,7 +1028,6 @@ const sendWithdrawalNotificationEmail = async (userEmail, userName, transaction)
   log('info', `Withdrawal notification email sent to admin for user ${userEmail}`);
 };
 
-// --- SUPPORT TICKET EMAIL ---
 const sendSupportTicketEmail = async (userEmail, userName, ticket) => {
   const categoryNames = {
     general: 'General Inquiry',
@@ -1170,12 +1111,11 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-const adminMiddleware = (req, res, next) => {
-  const userRow = db.prepare('SELECT isAdmin FROM users WHERE id = ?').get(req.user.id);
+const adminMiddleware = async (req, res, next) => {
+  const userRow = await db.getAsync('SELECT isAdmin FROM users WHERE id = ?', req.user.id);
   if (!userRow || !userRow.isAdmin) return res.status(403).json({ error: 'Admin access required.' });
   next();
 };
-
 
 // ================================================================
 // AUTH ROUTES
@@ -1190,7 +1130,7 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    const existing = await db.getAsync('SELECT id FROM users WHERE email = ?', email);
     if (existing) return res.status(400).json({ error: 'User already exists.' });
 
     const verificationCode = generateVerificationCode();
@@ -1199,25 +1139,25 @@ app.post('/api/auth/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const stmt = db.prepare(`
+    const stmt = await db.runAsync(`
       INSERT INTO users (
         name, email, password, country, phone,
         verificationCode, verificationCodeExpires, verified, balance, updatedAt
       ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 50, strftime('%s', 'now'))
-    `);
-    const info = stmt.run(name, email, hashedPassword, country, phone || '', verificationCode, codeExpires);
+    `, name, email, hashedPassword, country, phone || '', verificationCode, codeExpires);
+    const userId = stmt.lastInsertRowid;
 
-    db.prepare(`
+    await db.runAsync(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
       VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?)
-    `).run(info.lastInsertRowid, generateReference());
+    `, userId, generateReference());
 
     await sendVerificationEmail(email, verificationCode);
 
-    log('info', `New user registered: ${email} (ID: ${info.lastInsertRowid})`);
+    log('info', `New user registered: ${email} (ID: ${userId})`);
     res.status(201).json({
       message: 'Registration successful. Check your email for verification code. You received $50 signup bonus!',
-      userId: info.lastInsertRowid,
+      userId: userId,
     });
   } catch (error) {
     log('error', 'Registration error', error);
@@ -1230,7 +1170,7 @@ app.post('/api/auth/verify', async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: 'Email and code are required.' });
 
-    const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1240,12 +1180,12 @@ app.post('/api/auth/verify', async (req, res) => {
       return res.status(400).json({ error: 'Code expired. Request a new one.' });
     }
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET verified = 1, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(user.id);
+    `, user.id);
 
-    const updatedRow = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = ?', user.id);
     const updatedUser = rowToUser(updatedRow);
     const token = jwt.sign(
       { id: updatedUser.id, email: updatedUser.email },
@@ -1282,7 +1222,7 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-    const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1290,10 +1230,10 @@ app.post('/api/auth/resend-verification', async (req, res) => {
 
     const verificationCode = generateVerificationCode();
     const codeExpires = Math.floor(Date.now() / 1000) + 10 * 60;
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET verificationCode = ?, verificationCodeExpires = ?, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(verificationCode, codeExpires, user.id);
+    `, verificationCode, codeExpires, user.id);
 
     await sendVerificationEmail(email, verificationCode);
     res.json({ message: 'New verification code sent.' });
@@ -1308,7 +1248,7 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
 
-    const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
     if (!userRow) return res.status(401).json({ error: 'Invalid credentials.' });
     const user = rowToUser(userRow);
 
@@ -1322,7 +1262,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Please verify your email before logging in.' });
     }
 
-    db.prepare(`UPDATE users SET updatedAt = strftime('%s', 'now') WHERE id = ?`).run(user.id);
+    await db.runAsync(`UPDATE users SET updatedAt = strftime('%s', 'now') WHERE id = ?`, user.id);
 
     const token = jwt.sign(
       { id: user.id, email: user.email },
@@ -1359,7 +1299,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-    const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
     if (!userRow) {
       return res.json({ message: 'If an account exists, a reset code has been sent.' });
     }
@@ -1367,10 +1307,10 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     const resetCode = generateResetCode();
     const codeExpires = Math.floor(Date.now() / 1000) + 15 * 60;
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET verificationCode = ?, verificationCodeExpires = ?, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(resetCode, codeExpires, user.id);
+    `, resetCode, codeExpires, user.id);
 
     await sendPasswordResetEmail(email, resetCode);
     res.json({ message: 'If an account exists, a reset code has been sent.' });
@@ -1390,7 +1330,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE email = ?', email);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1402,10 +1342,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET password = ?, verificationCode = NULL, verificationCodeExpires = NULL, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(hashedPassword, user.id);
+    `, hashedPassword, user.id);
 
     log('info', `Password reset for user: ${email} (ID: ${user.id})`);
     res.json({ message: 'Password reset successfully. Please login with your new password.' });
@@ -1419,9 +1359,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 // USER ROUTES (protected)
 // ================================================================
 
-app.get('/api/user/me', authMiddleware, (req, res) => {
+app.get('/api/user/me', authMiddleware, async (req, res) => {
   try {
-    const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
     delete user.password;
@@ -1434,18 +1374,18 @@ app.get('/api/user/me', authMiddleware, (req, res) => {
   }
 });
 
-app.put('/api/user/update', authMiddleware, (req, res) => {
+app.put('/api/user/update', authMiddleware, async (req, res) => {
   try {
     const { name, phone, country, profilePicture } = req.body;
 
-    const userTableInfo = db.prepare("PRAGMA table_info(users)").all();
+    const userTableInfo = await db.allAsync("PRAGMA table_info(users)");
     const existingColumns = userTableInfo.map(c => c.name);
 
     const columnsToEnsure = ['profilePicture', 'updatedAt', 'selectedPlan', 'balance'];
     for (const col of columnsToEnsure) {
       if (!existingColumns.includes(col)) {
         console.log(`⚠️ Column ${col} missing – adding now...`);
-        db.exec(`ALTER TABLE users ADD COLUMN ${col} TEXT DEFAULT NULL`);
+        await db.execAsync(`ALTER TABLE users ADD COLUMN ${col} TEXT DEFAULT NULL`);
         console.log(`✅ Column ${col} added.`);
       }
     }
@@ -1466,16 +1406,9 @@ app.put('/api/user/update', authMiddleware, (req, res) => {
     values.push(req.user.id);
 
     const query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
+    await db.runAsync(query, ...values);
 
-    const fieldNames = updates.map(u => u.split(' ')[0]).join(', ');
-    console.log(`🔄 Updating user ${req.user.id} (fields: ${fieldNames})`);
-    if (process.env.NODE_ENV === 'development') {
-      console.log('Query:', query);
-    }
-
-    db.prepare(query).run(...values);
-
-    const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
     const user = rowToUser(userRow);
     delete user.password;
     delete user.verificationCode;
@@ -1500,7 +1433,7 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters.' });
     }
 
-    const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const user = rowToUser(userRow);
 
@@ -1510,9 +1443,9 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET password = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `).run(hashedPassword, user.id);
+    `, hashedPassword, user.id);
 
     log('info', `Password changed for user ${user.email} (ID: ${user.id})`);
     res.json({ message: 'Password changed successfully.' });
@@ -1522,7 +1455,7 @@ app.put('/api/user/change-password', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/api/user/transactions', authMiddleware, (req, res) => {
+app.get('/api/user/transactions', authMiddleware, async (req, res) => {
   try {
     const { limit = 50, offset = 0, type } = req.query;
     let query = 'SELECT * FROM transactions WHERE userId = ?';
@@ -1536,7 +1469,7 @@ app.get('/api/user/transactions', authMiddleware, (req, res) => {
     query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
     params.push(parseInt(limit), parseInt(offset));
 
-    const rows = db.prepare(query).all(...params);
+    const rows = await db.allAsync(query, ...params);
     const transactions = rows.map(rowToTransaction);
 
     let countQuery = 'SELECT COUNT(*) as total FROM transactions WHERE userId = ?';
@@ -1545,7 +1478,8 @@ app.get('/api/user/transactions', authMiddleware, (req, res) => {
       countQuery += ' AND type = ?';
       countParams.push(type);
     }
-    const total = db.prepare(countQuery).get(...countParams).total;
+    const totalRow = await db.getAsync(countQuery, ...countParams);
+    const total = totalRow ? totalRow.total : 0;
 
     res.json({ transactions, pagination: { total, limit: parseInt(limit), offset: parseInt(offset) } });
   } catch (error) {
@@ -1554,9 +1488,9 @@ app.get('/api/user/transactions', authMiddleware, (req, res) => {
   }
 });
 
-app.get('/api/user/balance', authMiddleware, (req, res) => {
+app.get('/api/user/balance', authMiddleware, async (req, res) => {
   try {
-    const row = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.user.id);
+    const row = await db.getAsync('SELECT balance FROM users WHERE id = ?', req.user.id);
     if (!row) return res.status(404).json({ error: 'User not found.' });
     res.json({ balance: row.balance || 0 });
   } catch (error) {
@@ -1578,66 +1512,47 @@ app.post('/api/user/deposit', authMiddleware, async (req, res) => {
 
         const depositAmount = parseFloat(amount);
         let usdAmount = depositAmount;
-
-        // ---- Currency conversion ----
         let exchangeRate = 1;
         let originalCurrency = currency.toUpperCase();
         let originalAmount = depositAmount;
-        let feePercent = 2.5; // 2.5% deposit fee
+        let feePercent = 2.5;
         let feeAmount = 0;
 
-        // Get exchange rates
         const rates = await getExchangeRates();
 
         if (originalCurrency !== 'USD') {
-            // Convert from user's currency to USD
             const rate = rates[originalCurrency];
             if (!rate) {
                 return res.status(400).json({ error: `Unsupported currency: ${originalCurrency}` });
             }
-            exchangeRate = 1 / rate; // USD per 1 unit of user's currency
+            exchangeRate = 1 / rate;
             usdAmount = depositAmount * exchangeRate;
         }
 
-        // Apply deposit fee (2.5%)
         feeAmount = usdAmount * (feePercent / 100);
         const finalUsdAmount = usdAmount - feeAmount;
 
-        // Check minimum deposit (e.g., $10 USD after conversion)
         if (finalUsdAmount < 10) {
             return res.status(400).json({
                 error: `Minimum deposit is $10 USD after fees. Your deposit of ${originalAmount} ${originalCurrency} is worth $${usdAmount.toFixed(2)} (after ${feePercent}% fee: $${finalUsdAmount.toFixed(2)}).`
             });
         }
 
-        // ---- Store transaction ----
         const reference = generateReference();
         const description = `Deposit via ${method || 'bank'} (${originalAmount} ${originalCurrency} → $${usdAmount.toFixed(2)} USD, fee: ${feePercent}%)`;
 
-        const info = db.prepare(`
+        const info = await db.runAsync(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference, proof,
                 currency, originalAmount, exchangeRate, feePercent, feeAmount
             ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-            req.user.id,
-            'deposit',
-            finalUsdAmount, // This is the actual USD amount added to balance
-            method || 'bank',
-            description,
-            reference,
-            proof || null,
-            originalCurrency,
-            originalAmount,
-            exchangeRate,
-            feePercent,
-            feeAmount
-        );
+        `, req.user.id, 'deposit', finalUsdAmount, method || 'bank', description, reference, proof || null,
+            originalCurrency, originalAmount, exchangeRate, feePercent, feeAmount);
+        const transactionId = info.lastInsertRowid;
+        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+        const transaction = rowToTransaction(transactionRow);
 
-        const transaction = rowToTransaction(db.prepare('SELECT * FROM transactions WHERE id = ?').get(info.lastInsertRowid));
-
-        // ---- Email notification ----
-        const userRow = db.prepare('SELECT name, email FROM users WHERE id = ?').get(req.user.id);
+        const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
         if (userRow) {
             await sendDepositNotificationEmail(userRow.email, userRow.name, transaction, proof || null);
         }
@@ -1675,7 +1590,6 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         const depositAmount = parseFloat(amount);
         const user = req.user;
 
-        // ---- Currency conversion & minimum check ----
         const rates = await getExchangeRates();
         let usdAmount = depositAmount;
         let exchangeRate = 1;
@@ -1685,17 +1599,14 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
             if (!rate) {
                 return res.status(400).json({ error: `Unsupported currency: ${currency}` });
             }
-            // Convert to USD
-            usdAmount = depositAmount / rate;      // rate = units of foreign per 1 USD
-            exchangeRate = 1 / rate;               // USD per 1 unit of foreign
+            usdAmount = depositAmount / rate;
+            exchangeRate = 1 / rate;
         }
 
-        // Apply 2.5% fee (for consistency with /api/user/deposit)
         const feePercent = 2.5;
         const feeAmount = usdAmount * (feePercent / 100);
         const finalUsdAmount = usdAmount - feeAmount;
 
-        // Minimum check: $100 USD after fee
         const MIN_USD = 100;
         if (finalUsdAmount < MIN_USD) {
             return res.status(400).json({
@@ -1704,8 +1615,7 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
             });
         }
 
-        // ---- Proceed with payment ----
-        const userRow = db.prepare('SELECT email, name FROM users WHERE id = ?').get(user.id);
+        const userRow = await db.getAsync('SELECT email, name FROM users WHERE id = ?', user.id);
         if (!userRow) {
             return res.status(404).json({ error: 'User not found.' });
         }
@@ -1713,10 +1623,11 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         const reference = generateReference();
         log('info', `Flutterwave: Creating payment for reference: ${reference}, amount: ${depositAmount} ${currency}`);
 
-        const info = db.prepare(`
+        const info = await db.runAsync(`
             INSERT INTO transactions (userId, type, amount, status, method, description, reference, proof)
             VALUES (?, 'deposit', ?, 'pending', 'card', 'Flutterwave deposit', ?, ?)
-        `).run(user.id, depositAmount, reference, 'pending');
+        `, user.id, depositAmount, reference, 'pending');
+        const transactionId = info.lastInsertRowid;
 
         const redirectUrl = `http://localhost:5000/api/deposit/verify/${reference}`;
 
@@ -1756,14 +1667,14 @@ app.post('/api/deposit/flutterwave', authMiddleware, async (req, res) => {
         if (response.data.status === 'success') {
             const paymentLink = response.data.data.link;
             log('info', `Flutterwave: Payment link created: ${paymentLink}`);
-            db.prepare(`UPDATE transactions SET proof = ? WHERE id = ?`).run(paymentLink, info.lastInsertRowid);
+            await db.runAsync(`UPDATE transactions SET proof = ? WHERE id = ?`, paymentLink, transactionId);
 
             res.json({
                 success: true,
                 link: paymentLink,
                 reference: reference,
                 transaction: {
-                    id: info.lastInsertRowid,
+                    id: transactionId,
                     amount: depositAmount,
                     currency: currency,
                     reference: reference
@@ -1794,9 +1705,7 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
         const reference = req.params.reference;
         const userId = req.user.id;
 
-        // 1. Check database
-        const tx = db.prepare('SELECT * FROM transactions WHERE reference = ? AND userId = ?')
-            .get(reference, userId);
+        const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = ? AND userId = ?', reference, userId);
 
         if (!tx) {
             return res.status(404).json({ status: 'not_found', error: 'Transaction not found.' });
@@ -1809,7 +1718,6 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
             return res.json({ status: 'failed' });
         }
 
-        // 2. Verify with Flutterwave
         try {
             const response = await axios.get(
                 `https://api.flutterwave.com/v3/transactions/${reference}/verify`,
@@ -1817,37 +1725,32 @@ app.get('/api/deposit/verify/:reference', authMiddleware, async (req, res) => {
             );
             const data = response.data;
             if (data.status === 'success' && data.data.status === 'successful') {
-                db.prepare(`UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now') WHERE id = ?`).run(tx.id);
-                db.prepare(`UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now') WHERE id = ?`).run(tx.amount, userId);
+                await db.runAsync(`UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
+                await db.runAsync(`UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, tx.amount, userId);
                 return res.json({ status: 'completed' });
             } else if (data.data.status === 'failed') {
-                db.prepare(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`).run(tx.id);
+                await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
                 return res.json({ status: 'failed' });
             } else {
                 return res.json({ status: 'pending' });
             }
         } catch (apiError) {
-            // ---- IMPROVED: treat "not found" as pending for first 2 minutes ----
             if (apiError.response && apiError.response.status === 400) {
                 const errorData = apiError.response.data;
                 if (errorData && errorData.message && errorData.message.includes('No transaction was found')) {
-                    const createdAt = tx.createdAt; // seconds since epoch
+                    const createdAt = tx.createdAt;
                     const now = Math.floor(Date.now() / 1000);
                     const age = now - createdAt;
-
-                    // If the transaction was created less than 2 minutes ago,
-                    // keep it as pending – Flutterwave might not have registered it yet.
                     if (age < 120) {
                         log('info', `Transaction ${reference} not found on Flutterwave yet (age ${age}s), keeping as pending`);
                         return res.json({ status: 'pending' });
                     } else {
                         log('info', `Transaction ${reference} marked as failed (not found on Flutterwave after ${age}s)`);
-                        db.prepare(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`).run(tx.id);
+                        await db.runAsync(`UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now') WHERE id = ?`, tx.id);
                         return res.json({ status: 'failed', message: 'Transaction not found on Flutterwave' });
                     }
                 }
             }
-            // Any other error – throw so it goes to the outer catch
             throw apiError;
         }
     } catch (error) {
@@ -1861,7 +1764,6 @@ app.post('/api/webhooks/flutterwave', express.json(), async (req, res) => {
         const event = req.body;
         const secretHash = process.env.FLUTTERWAVE_SECRET_HASH;
 
-        // Verify webhook signature
         const signature = req.headers['verif-hash'];
         if (secretHash && signature !== secretHash) {
             return res.status(401).json({ error: 'Invalid signature' });
@@ -1871,46 +1773,41 @@ app.post('/api/webhooks/flutterwave', express.json(), async (req, res) => {
             const txRef = event.data.tx_ref;
             const status = event.data.status;
 
-            // Find transaction
-            const tx = db.prepare('SELECT * FROM transactions WHERE reference = ?').get(txRef);
+            const tx = await db.getAsync('SELECT * FROM transactions WHERE reference = ?', txRef);
             if (!tx || tx.status === 'completed') {
                 return res.status(200).send('OK');
             }
 
             if (status === 'successful') {
-                // 1. Update transaction and user balance
-                db.prepare(`
+                await db.runAsync(`
                     UPDATE transactions SET status = 'completed', completedAt = strftime('%s', 'now')
                     WHERE id = ?
-                `).run(tx.id);
+                `, tx.id);
 
-                db.prepare(`
+                await db.runAsync(`
                     UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now')
                     WHERE id = ?
-                `).run(tx.amount, tx.userId);
+                `, tx.amount, tx.userId);
 
                 log('info', `Webhook: Deposit ${tx.amount} completed for user ${tx.userId}`);
 
-                // 2. Send admin email notification for this card deposit
                 try {
-                    const user = db.prepare('SELECT name, email FROM users WHERE id = ?').get(tx.userId);
+                    const user = await db.getAsync('SELECT name, email FROM users WHERE id = ?', tx.userId);
                     if (user) {
-                        // Pass null as proof (card deposits don't have a proof image)
                         await sendDepositNotificationEmail(user.email, user.name, tx, null);
                         log('info', `Admin email sent for card deposit ${txRef} (user: ${user.email})`);
                     } else {
                         log('warn', `User not found for card deposit ${txRef} (userId: ${tx.userId})`);
                     }
                 } catch (emailError) {
-                    // Log error but don't break the webhook response
                     log('error', 'Failed to send admin email for card deposit', { error: emailError.message });
                 }
 
             } else if (status === 'failed') {
-                db.prepare(`
+                await db.runAsync(`
                     UPDATE transactions SET status = 'failed', completedAt = strftime('%s', 'now')
                     WHERE id = ?
-                `).run(tx.id);
+                `, tx.id);
             }
         }
 
@@ -1940,8 +1837,7 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
       return res.status(400).json({ error: 'Proof image is required (as file or base64).' });
     }
 
-    const transaction = db.prepare('SELECT * FROM transactions WHERE id = ? AND userId = ?')
-      .get(transactionId, req.user.id);
+    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ? AND userId = ?', transactionId, req.user.id);
     if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
     if (transaction.status !== 'pending') return res.status(400).json({ error: 'Transaction already processed.' });
     if (transaction.type !== 'deposit') return res.status(400).json({ error: 'Not a deposit.' });
@@ -1954,19 +1850,20 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
       proofForDb = `data:${mimeType};base64,${base64}`;
     }
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE transactions SET proof = ?, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(proofForDb, transactionId);
+    `, proofForDb, transactionId);
 
-    const userRow = db.prepare('SELECT name, email FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
     await sendDepositProofEmail(userRow.email, userRow.name, transaction, proofData);
 
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
-    const updatedTransaction = rowToTransaction(db.prepare('SELECT * FROM transactions WHERE id = ?').get(transactionId));
+    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const updatedTransaction = rowToTransaction(updatedTransactionRow);
 
     log('info', `Deposit proof uploaded for transaction ${transactionId} by user ${req.user.id}`);
     res.json({
@@ -1982,7 +1879,6 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
   }
 });
 
-
 // ================================================================
 // PUBLIC CONTACT ROUTE (no auth required)
 // ================================================================
@@ -1994,12 +1890,10 @@ app.post('/api/contact', async (req, res) => {
             return res.status(400).json({ error: 'Name, email, and message are required.' });
         }
 
-        // Optional: send email notification to admin
-        // You can reuse the transporter from earlier
         if (transporter) {
             await transporter.sendMail({
                 from: process.env.EMAIL_USER,
-                to: 'nexusai58@gmail.com', // or your admin email
+                to: 'nexusai58@gmail.com',
                 subject: `New Contact Form Submission: ${subject || 'No subject'}`,
                 html: `
                     <div style="font-family:Arial;max-width:600px;margin:0 auto;padding:20px;background:#0b0b0e;color:#f0f0f5;border-radius:12px;">
@@ -2020,9 +1914,6 @@ app.post('/api/contact', async (req, res) => {
             });
         }
 
-        // Optionally store the contact message in the database (you can create a 'contacts' table)
-        // For now, we just log and respond
-
         log('info', `Contact form submitted by ${email} (${name})`);
         res.json({ message: 'Thank you! Your message has been sent. We\'ll get back to you shortly.' });
     } catch (error) {
@@ -2031,14 +1922,14 @@ app.post('/api/contact', async (req, res) => {
     }
 });
 
-app.get('/api/admin/support', authMiddleware, adminMiddleware, (req, res) => {
+app.get('/api/admin/support', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const tickets = db.prepare(`
+    const tickets = await db.allAsync(`
       SELECT st.*, u.name as userName, u.email as userEmail
       FROM support_tickets st
       LEFT JOIN users u ON st.userId = u.id
       ORDER BY st.createdAt DESC
-    `).all();
+    `);
     res.json({ tickets });
   } catch (error) {
     log('error', 'Get admin support error', error);
@@ -2046,29 +1937,22 @@ app.get('/api/admin/support', authMiddleware, adminMiddleware, (req, res) => {
   }
 });
 
-app.post('/api/admin/notify', authMiddleware, adminMiddleware, (req, res) => {
+app.post('/api/admin/notify', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { title, message, type = 'info' } = req.body;
     if (!title || !message) {
       return res.status(400).json({ error: 'Title and message are required.' });
     }
 
-    // Get all user IDs
-    const users = db.prepare('SELECT id FROM users').all();
+    const users = await db.allAsync('SELECT id FROM users');
     const now = Math.floor(Date.now() / 1000);
 
-    const insertStmt = db.prepare(`
-      INSERT INTO notifications (userId, title, message, type, createdAt)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-
-    const insertMany = db.transaction((userIds) => {
-      for (const user of userIds) {
-        insertStmt.run(user.id, title, message, type, now);
-      }
-    });
-
-    insertMany(users);
+    for (const user of users) {
+      await db.runAsync(`
+        INSERT INTO notifications (userId, title, message, type, createdAt)
+        VALUES (?, ?, ?, ?, ?)
+      `, user.id, title, message, type, now);
+    }
 
     log('info', `Broadcast notification sent to ${users.length} users`);
     res.json({ message: `Notification sent to ${users.length} users.` });
@@ -2078,14 +1962,14 @@ app.post('/api/admin/notify', authMiddleware, adminMiddleware, (req, res) => {
   }
 });
 
-app.get('/api/user/notifications', authMiddleware, (req, res) => {
+app.get('/api/user/notifications', authMiddleware, async (req, res) => {
   try {
-    const notifications = db.prepare(`
+    const notifications = await db.allAsync(`
       SELECT * FROM notifications
       WHERE userId = ?
       ORDER BY createdAt DESC
       LIMIT 50
-    `).all(req.user.id);
+    `, req.user.id);
     res.json({ notifications });
   } catch (error) {
     log('error', 'Get notifications error', error);
@@ -2093,7 +1977,7 @@ app.get('/api/user/notifications', authMiddleware, (req, res) => {
   }
 });
 
-app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, (req, res) => {
+app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const userId = req.params.id;
     const { planName } = req.body;
@@ -2102,20 +1986,19 @@ app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, (req, res)
       return res.status(400).json({ error: 'Invalid plan name.' });
     }
 
-    const userRow = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(userId);
+    const userRow = await db.getAsync('SELECT id, name, email FROM users WHERE id = ?', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET selectedPlan = ?, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(planName, userId);
+    `, planName, userId);
 
-    // Optionally create a transaction for plan assignment
     const reference = generateReference();
-    db.prepare(`
+    await db.runAsync(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
       VALUES (?, 'plan_purchase', 0, 'completed', 'Admin assigned plan: ' || ?, ?)
-    `).run(userId, planName, reference);
+    `, userId, planName, reference);
 
     log('info', `Admin assigned plan ${planName} to user ${userRow.email}`);
     res.json({ message: `Plan "${planName}" assigned to user.` });
@@ -2125,7 +2008,7 @@ app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, (req, res)
   }
 });
 
-app.put('/api/admin/deposit/:id/confirm', authMiddleware, adminMiddleware, (req, res) => {
+app.put('/api/admin/deposit/:id/confirm', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const transactionId = req.params.id;
     const { status } = req.body;
@@ -2134,26 +2017,27 @@ app.put('/api/admin/deposit/:id/confirm', authMiddleware, adminMiddleware, (req,
       return res.status(400).json({ error: 'Status must be "completed" or "failed".' });
     }
 
-    const transaction = db.prepare('SELECT * FROM transactions WHERE id = ?').get(transactionId);
+    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
     if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
     if (transaction.status !== 'pending' && transaction.status !== 'processing') {
       return res.status(400).json({ error: 'Transaction already finalized.' });
     }
     if (transaction.type !== 'deposit') return res.status(400).json({ error: 'Not a deposit.' });
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE transactions SET status = ?, completedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(status, transactionId);
+    `, status, transactionId);
 
     if (status === 'completed') {
-      db.prepare(`
+      await db.runAsync(`
         UPDATE users SET balance = balance + ?, updatedAt = strftime('%s', 'now')
         WHERE id = ?
-      `).run(transaction.amount, transaction.userId);
+      `, transaction.amount, transaction.userId);
     }
 
-    const updatedTransaction = rowToTransaction(db.prepare('SELECT * FROM transactions WHERE id = ?').get(transactionId));
+    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const updatedTransaction = rowToTransaction(updatedTransactionRow);
 
     log('info', `Deposit ${status}: $${transaction.amount} for user ${transaction.userId}`);
     res.json({ message: `Deposit ${status} successfully.`, transaction: updatedTransaction });
@@ -2176,14 +2060,13 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
         if (!address) return res.status(400).json({ error: 'Address is required.' });
 
         const withdrawAmount = parseFloat(amount);
-        const userRow = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.user.id);
+        const userRow = await db.getAsync('SELECT balance FROM users WHERE id = ?', req.user.id);
         if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-        // ---- Currency conversion ----
         let usdAmount = withdrawAmount;
         let exchangeRate = 1;
         let targetCurrency = currency.toUpperCase();
-        let feePercent = 5; // 5% withdrawal fee
+        let feePercent = 5;
         let feeAmount = 0;
 
         if (targetCurrency !== 'USD') {
@@ -2192,11 +2075,10 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
             if (!rate) {
                 return res.status(400).json({ error: `Unsupported currency: ${targetCurrency}` });
             }
-            exchangeRate = rate; // How many units of target currency per USD
-            usdAmount = withdrawAmount / exchangeRate; // Convert to USD
+            exchangeRate = rate;
+            usdAmount = withdrawAmount / exchangeRate;
         }
 
-        // Apply withdrawal fee (5%)
         feeAmount = usdAmount * (feePercent / 100);
         const totalUsdRequired = usdAmount + feeAmount;
 
@@ -2209,33 +2091,21 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
             });
         }
 
-        // ---- Store transaction ----
         const reference = generateReference();
         const description = `Withdrawal to ${address} (${withdrawAmount} ${targetCurrency})`;
 
-        const info = db.prepare(`
+        const info = await db.runAsync(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference,
                 currency, originalAmount, exchangeRate, feePercent, feeAmount
             ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-            req.user.id,
-            'withdrawal',
-            usdAmount, // This is the net USD amount (user receives this in target currency)
-            method || 'bank',
-            description,
-            reference,
-            targetCurrency,
-            withdrawAmount,
-            exchangeRate,
-            feePercent,
-            feeAmount
-        );
+        `, req.user.id, 'withdrawal', usdAmount, method || 'bank', description, reference,
+            targetCurrency, withdrawAmount, exchangeRate, feePercent, feeAmount);
+        const transactionId = info.lastInsertRowid;
+        const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+        const transaction = rowToTransaction(transactionRow);
 
-        const transaction = rowToTransaction(db.prepare('SELECT * FROM transactions WHERE id = ?').get(info.lastInsertRowid));
-
-        // ---- Email notification ----
-        const userData = db.prepare('SELECT name, email FROM users WHERE id = ?').get(req.user.id);
+        const userData = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
         if (userData) {
             await sendWithdrawalNotificationEmail(userData.email, userData.name, transaction);
         }
@@ -2258,7 +2128,7 @@ app.post('/api/user/withdraw', authMiddleware, async (req, res) => {
     }
 });
 
-app.put('/api/admin/withdraw/:id/confirm', authMiddleware, adminMiddleware, (req, res) => {
+app.put('/api/admin/withdraw/:id/confirm', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const transactionId = req.params.id;
     const { status } = req.body;
@@ -2266,24 +2136,25 @@ app.put('/api/admin/withdraw/:id/confirm', authMiddleware, adminMiddleware, (req
       return res.status(400).json({ error: 'Status must be "completed" or "failed".' });
     }
 
-    const transaction = db.prepare('SELECT * FROM transactions WHERE id = ?').get(transactionId);
+    const transaction = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
     if (!transaction) return res.status(404).json({ error: 'Transaction not found.' });
     if (transaction.status !== 'pending') return res.status(400).json({ error: 'Already processed.' });
     if (transaction.type !== 'withdrawal') return res.status(400).json({ error: 'Not a withdrawal.' });
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE transactions SET status = ?, completedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(status, transactionId);
+    `, status, transactionId);
 
     if (status === 'completed') {
-      db.prepare(`
+      await db.runAsync(`
         UPDATE users SET balance = balance - ?, updatedAt = strftime('%s', 'now')
         WHERE id = ?
-      `).run(transaction.amount, transaction.userId);
+      `, transaction.amount, transaction.userId);
     }
 
-    const updatedTransaction = rowToTransaction(db.prepare('SELECT * FROM transactions WHERE id = ?').get(transactionId));
+    const updatedTransactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = ?', transactionId);
+    const updatedTransaction = rowToTransaction(updatedTransactionRow);
 
     log('info', `Withdrawal ${status}: $${transaction.amount} for user ${transaction.userId}`);
     res.json({ message: `Withdrawal ${status} successfully.`, transaction: updatedTransaction });
@@ -2297,7 +2168,7 @@ app.put('/api/admin/withdraw/:id/confirm', authMiddleware, adminMiddleware, (req
 // PLAN PURCHASE ROUTE
 // ================================================================
 
-app.post('/api/plans/select', authMiddleware, (req, res) => {
+app.post('/api/plans/select', authMiddleware, async (req, res) => {
   try {
     const { planName } = req.body;
     const validPlans = ['Starter', 'Basic', 'Pro', 'Elite', 'Enterprise', 'Titan'];
@@ -2311,11 +2182,9 @@ app.post('/api/plans/select', authMiddleware, (req, res) => {
     }
     const price = planConfig.price;
 
-    const userRow = db.prepare('SELECT id, name, email, balance, selectedPlan FROM users WHERE id = ?')
-      .get(req.user.id);
+    const userRow = await db.getAsync('SELECT id, name, email, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-    // --- Prevent downgrade ---
     const currentPlan = userRow.selectedPlan;
     if (currentPlan) {
       const currentLevel = PLAN_ORDER[currentPlan];
@@ -2328,7 +2197,6 @@ app.post('/api/plans/select', authMiddleware, (req, res) => {
           error: `You cannot downgrade from ${currentPlan} to ${planName}. Only upgrades are allowed.`
         });
       }
-      // Optionally prevent re-purchasing the same plan
       if (newLevel === currentLevel) {
         return res.status(400).json({ error: `You are already on the ${currentPlan} plan.` });
       }
@@ -2346,24 +2214,23 @@ app.post('/api/plans/select', authMiddleware, (req, res) => {
     }
 
     const newBalance = currentBalance - price;
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET selectedPlan = ?, balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `).run(planName, newBalance, req.user.id);
+    `, planName, newBalance, req.user.id);
 
     const reference = generateReference();
-    db.prepare(`
+    await db.runAsync(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
       VALUES (?, 'plan_purchase', ?, 'completed', 'Plan purchase: ' || ?, ?)
-    `).run(req.user.id, price, planName, reference);
+    `, req.user.id, price, planName, reference);
 
-    const updatedRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+    const updatedRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
     const user = rowToUser(updatedRow);
     delete user.password;
     delete user.verificationCode;
     delete user.verificationCodeExpires;
 
     log('info', `Plan purchased: ${planName} for $${price} by user ${userRow.email} (ID: ${req.user.id})`);
-
     res.json({
       message: `✅ Plan "${planName}" purchased successfully for $${price}!`,
       plan: planName,
@@ -2389,7 +2256,6 @@ app.get('/api/plans', (req, res) => {
       Titan: ['Quantum AI', 'Sentiment analysis', 'Global coverage', 'Priority features', 'Executive team', 'Custom dashboards', 'Institutional liquidity', 'Regulatory reporting']
     };
     const features = baseFeatures[name] || [];
-    // Add plan-specific limits
     features.push(`Max trade per transaction: $${config.maxTrade.toLocaleString()}`);
     features.push(`Daily portfolio refreshes: ${config.refreshLimit === 999999 ? 'Unlimited' : config.refreshLimit}`);
     if (config.cashbackPercent > 0) {
@@ -2416,8 +2282,7 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Get user's plan
-    const userRow = db.prepare('SELECT selectedPlan FROM users WHERE id = ?').get(userId);
+    const userRow = await db.getAsync('SELECT selectedPlan FROM users WHERE id = ?', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     const planName = userRow.selectedPlan || 'Starter';
     const planConfig = PLAN_CONFIG[planName];
@@ -2426,7 +2291,7 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
     }
 
     const limit = planConfig.refreshLimit;
-    const check = checkAndIncrementDailyLimit(userId, 'refresh_portfolio', limit);
+    const check = await checkAndIncrementDailyLimit(userId, 'refresh_portfolio', limit);
     if (!check.allowed) {
       return res.status(429).json({
         error: `Daily refresh limit reached (${limit} per day). Please upgrade your plan for more refreshes.`,
@@ -2436,8 +2301,7 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
       });
     }
 
-    // Fetch holdings and prices
-    const holdingsRows = db.prepare('SELECT * FROM holdings WHERE userId = ?').all(userId);
+    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', userId);
     if (holdingsRows.length === 0) {
       return res.json({
         holdings: [],
@@ -2482,7 +2346,7 @@ app.get('/api/user/refresh-portfolio', authMiddleware, async (req, res) => {
 app.get('/api/user/holdings', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const holdingsRows = db.prepare('SELECT * FROM holdings WHERE userId = ?').all(userId);
+    const holdingsRows = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', userId);
     if (holdingsRows.length === 0) {
       return res.json({ holdings: [], totalValue: 0 });
     }
@@ -2519,7 +2383,7 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Unsupported crypto symbol.' });
     }
 
-    const userRow = db.prepare('SELECT id, balance, selectedPlan FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     if (!userRow.selectedPlan) {
       return res.status(400).json({ error: 'You must purchase a plan before trading.' });
@@ -2554,14 +2418,10 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
 
     const newBalance = userRow.balance - amountUSD;
 
-    // ---- Update user balance ----
-    db.prepare(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`)
-      .run(newBalance, req.user.id);
+    await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, newBalance, req.user.id);
     console.log(`[buy] User ${req.user.id} balance updated to ${newBalance}`);
 
-    // ---- Update holdings ----
-    const existing = db.prepare('SELECT * FROM holdings WHERE userId = ? AND symbol = ?')
-      .get(req.user.id, symbol);
+    const existing = await db.getAsync('SELECT * FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbol);
 
     let holdingsUpdated = false;
     try {
@@ -2569,16 +2429,16 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
         const totalAmount = existing.amount + cryptoAmount;
         const totalCost = (existing.amount * existing.averagePrice) + amountUSD;
         const newAvg = totalCost / totalAmount;
-        db.prepare(`
+        await db.runAsync(`
           UPDATE holdings SET amount = ?, averagePrice = ?, updatedAt = strftime('%s', 'now')
           WHERE userId = ? AND symbol = ?
-        `).run(totalAmount, newAvg, req.user.id, symbol);
+        `, totalAmount, newAvg, req.user.id, symbol);
         console.log(`[buy] Updated holdings for ${symbol}: amount=${totalAmount}, avg=${newAvg}`);
       } else {
-        db.prepare(`
+        await db.runAsync(`
           INSERT INTO holdings (userId, symbol, amount, averagePrice, createdAt, updatedAt)
           VALUES (?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-        `).run(req.user.id, symbol, cryptoAmount, price);
+        `, req.user.id, symbol, cryptoAmount, price);
         console.log(`[buy] Inserted new holding for ${symbol}: amount=${cryptoAmount}, price=${price}`);
       }
       holdingsUpdated = true;
@@ -2587,37 +2447,33 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
       throw new Error('Failed to update holdings: ' + holdingsError.message);
     }
 
-    // ---- Create transaction record ----
     const reference = generateReference();
-    db.prepare(`
+    await db.runAsync(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
       VALUES (?, 'trade', ?, 'completed', 'Buy ${symbol} with $${amountUSD}', ?)
-    `).run(req.user.id, amountUSD, reference);
+    `, req.user.id, amountUSD, reference);
 
-    // ---- Cashback bonus (if plan allows) ----
     let cashbackAmount = 0;
     let finalBalance = newBalance;
     if (planConfig.cashbackPercent > 0) {
       cashbackAmount = amountUSD * (planConfig.cashbackPercent / 100);
       finalBalance = newBalance + cashbackAmount;
-      db.prepare(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`)
-        .run(finalBalance, req.user.id);
+      await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, finalBalance, req.user.id);
       const bonusRef = generateReference();
-      db.prepare(`
+      await db.runAsync(`
         INSERT INTO transactions (userId, type, amount, status, description, reference)
         VALUES (?, 'bonus', ?, 'completed', 'Trading cashback (${planConfig.cashbackPercent}%) on $${amountUSD}', ?)
-      `).run(req.user.id, cashbackAmount, bonusRef);
+      `, req.user.id, cashbackAmount, bonusRef);
       console.log(`[buy] Cashback ${cashbackAmount} credited to user ${req.user.id}`);
     }
 
-    // ---- Fetch updated user and holdings ----
-    const updatedUser = rowToUser(db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id));
+    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const updatedUser = rowToUser(updatedUserRow);
     delete updatedUser.password;
     delete updatedUser.verificationCode;
     delete updatedUser.verificationCodeExpires;
 
-    // Also fetch the updated holdings list to return it
-    const updatedHoldings = db.prepare('SELECT * FROM holdings WHERE userId = ?').all(req.user.id);
+    const updatedHoldings = await db.allAsync('SELECT * FROM holdings WHERE userId = ?', req.user.id);
     const symbols = updatedHoldings.map(h => h.symbol);
     const currentPrices = await getCryptoPrices(symbols);
     const holdingsWithPrice = updatedHoldings.map(h => ({
@@ -2630,7 +2486,6 @@ app.post('/api/user/buy', authMiddleware, async (req, res) => {
     }));
 
     log('info', `User ${req.user.id} bought ${cryptoAmount} ${symbol} for $${amountUSD}, cashback: $${cashbackAmount}`);
-
     res.json({
       message: `✅ Bought ${cryptoAmount.toFixed(6)} ${symbol} for $${amountUSD.toFixed(2)} at $${price.toFixed(2)} per coin.`,
       newBalance: finalBalance,
@@ -2664,12 +2519,10 @@ app.post('/api/user/sell', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Unsupported crypto symbol.' });
     }
 
-    const userRow = db.prepare('SELECT id, balance, selectedPlan FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT id, balance, selectedPlan FROM users WHERE id = ?', req.user.id);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-    const holding = db.prepare('SELECT * FROM holdings WHERE userId = ? AND symbol = ?')
-      .get(req.user.id, symbolUpper);
-
+    const holding = await db.getAsync('SELECT * FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
     if (!holding) {
       return res.status(400).json({ error: `You don't own any ${symbolUpper}.` });
     }
@@ -2690,32 +2543,30 @@ app.post('/api/user/sell', authMiddleware, async (req, res) => {
     const newAmount = holding.amount - amount;
 
     if (newAmount <= 0.000001) {
-      db.prepare('DELETE FROM holdings WHERE userId = ? AND symbol = ?')
-        .run(req.user.id, symbolUpper);
+      await db.runAsync('DELETE FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
     } else {
-      db.prepare(`
+      await db.runAsync(`
         UPDATE holdings SET amount = ?, updatedAt = strftime('%s', 'now')
         WHERE userId = ? AND symbol = ?
-      `).run(newAmount, req.user.id, symbolUpper);
+      `, newAmount, req.user.id, symbolUpper);
     }
 
     const newBalance = userRow.balance + usdValue;
-    db.prepare(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`)
-      .run(newBalance, req.user.id);
+    await db.runAsync(`UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?`, newBalance, req.user.id);
 
     const reference = generateReference();
-    db.prepare(`
+    await db.runAsync(`
       INSERT INTO transactions (userId, type, amount, status, description, reference)
       VALUES (?, 'trade', ?, 'completed', 'Sell ${amount.toFixed(6)} ${symbolUpper} for $${usdValue.toFixed(2)}', ?)
-    `).run(req.user.id, usdValue, reference);
+    `, req.user.id, usdValue, reference);
 
-    const updatedUser = rowToUser(db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id));
+    const updatedUserRow = await db.getAsync('SELECT * FROM users WHERE id = ?', req.user.id);
+    const updatedUser = rowToUser(updatedUserRow);
     delete updatedUser.password;
     delete updatedUser.verificationCode;
     delete updatedUser.verificationCodeExpires;
 
     log('info', `User ${req.user.id} sold ${amount} ${symbolUpper} for $${usdValue}`);
-
     res.json({
       message: `✅ Sold ${amount.toFixed(6)} ${symbolUpper} for $${usdValue.toFixed(2)} at $${price.toFixed(2)} per coin.`,
       newBalance,
@@ -2748,9 +2599,7 @@ app.get('/api/user/sell-preview', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be a positive number.' });
     }
 
-    const holding = db.prepare('SELECT amount FROM holdings WHERE userId = ? AND symbol = ?')
-      .get(req.user.id, symbolUpper);
-
+    const holding = await db.getAsync('SELECT amount FROM holdings WHERE userId = ? AND symbol = ?', req.user.id, symbolUpper);
     if (!holding || holding.amount < amountNum) {
       return res.status(400).json({
         error: 'Insufficient balance.',
@@ -2797,21 +2646,21 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
     const ticketCategory = validCategories.includes(category) ? category : 'general';
     const ticketPriority = validPriorities.includes(priority) ? priority : 'medium';
 
-    const stmt = db.prepare(`
+    const info = await db.runAsync(`
       INSERT INTO support_tickets (userId, subject, category, priority, message, attachment, createdAt, updatedAt)
       VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-    `);
-    const info = stmt.run(req.user.id, subject, ticketCategory, ticketPriority, message, attachment || null);
+    `, req.user.id, subject, ticketCategory, ticketPriority, message, attachment || null);
+    const ticketId = info.lastInsertRowid;
 
-    const ticket = db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(info.lastInsertRowid);
+    const ticketRow = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
+    const ticket = ticketRow;
 
-    const userRow = db.prepare('SELECT name, email FROM users WHERE id = ?').get(req.user.id);
+    const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = ?', req.user.id);
     if (userRow) {
       await sendSupportTicketEmail(userRow.email, userRow.name, ticket);
     }
 
-    log('info', `Support ticket created: ${subject} for user ${req.user.id} (ID: ${info.lastInsertRowid})`);
-
+    log('info', `Support ticket created: ${subject} for user ${req.user.id} (ID: ${ticketId})`);
     res.status(201).json({
       message: 'Support request sent successfully! We\'ll get back to you within 24 hours.',
       ticket: {
@@ -2829,14 +2678,14 @@ app.post('/api/user/support', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/api/user/support', authMiddleware, (req, res) => {
+app.get('/api/user/support', authMiddleware, async (req, res) => {
   try {
-    const tickets = db.prepare(`
+    const tickets = await db.allAsync(`
       SELECT id, subject, category, priority, status, message, adminReply, createdAt, updatedAt
       FROM support_tickets
       WHERE userId = ?
       ORDER BY createdAt DESC
-    `).all(req.user.id);
+    `, req.user.id);
 
     res.json({
       tickets: tickets.map(t => ({
@@ -2851,7 +2700,7 @@ app.get('/api/user/support', authMiddleware, (req, res) => {
   }
 });
 
-app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, (req, res) => {
+app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { reply, status } = req.body;
     const ticketId = req.params.id;
@@ -2860,7 +2709,7 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, (req, r
       return res.status(400).json({ error: 'Reply message is required.' });
     }
 
-    const ticket = db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(ticketId);
+    const ticket = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
     if (!ticket) {
       return res.status(404).json({ error: 'Ticket not found.' });
     }
@@ -2869,13 +2718,13 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, (req, r
     const validStatuses = ['open', 'in_progress', 'resolved', 'closed'];
     const finalStatus = validStatuses.includes(newStatus) ? newStatus : ticket.status;
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE support_tickets
       SET adminReply = ?, status = ?, updatedAt = strftime('%s', 'now')
       WHERE id = ?
-    `).run(reply, finalStatus, ticketId);
+    `, reply, finalStatus, ticketId);
 
-    const updatedTicket = db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(ticketId);
+    const updatedTicket = await db.getAsync('SELECT * FROM support_tickets WHERE id = ?', ticketId);
 
     log('info', `Support ticket ${ticketId} replied by admin`);
     res.json({
@@ -2896,12 +2745,12 @@ app.put('/api/admin/support/:id/reply', authMiddleware, adminMiddleware, (req, r
 // ADMIN ROUTES
 // ================================================================
 
-app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
+app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const rows = db.prepare(`
+    const rows = await db.allAsync(`
       SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
       FROM users ORDER BY createdAt DESC
-    `).all();
+    `);
     res.json(rows.map(r => ({ ...r, createdAt: new Date(r.createdAt * 1000) })));
   } catch (error) {
     log('error', 'Get admin users error', error);
@@ -2909,12 +2758,12 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
   }
 });
 
-app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) => {
+app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const row = db.prepare(`
+    const row = await db.getAsync(`
       SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
       FROM users WHERE id = ?
-    `).get(req.params.id);
+    `, req.params.id);
     if (!row) return res.status(404).json({ error: 'User not found.' });
     res.json({ ...row, createdAt: new Date(row.createdAt * 1000) });
   } catch (error) {
@@ -2923,40 +2772,33 @@ app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) => {
   }
 });
 
-app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
+app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const totalUsers = db.prepare('SELECT COUNT(*) as count FROM users').get();
-    const verifiedUsers = db.prepare('SELECT COUNT(*) as count FROM users WHERE verified = 1').get();
-    const blockedUsers = db.prepare('SELECT COUNT(*) as count FROM users WHERE blocked = 1').get();
-    const totalBalance = db.prepare('SELECT SUM(balance) as total FROM users').get();
-    const plans = db.prepare(`
+    const totalUsers = await db.getAsync('SELECT COUNT(*) as count FROM users');
+    const verifiedUsers = await db.getAsync('SELECT COUNT(*) as count FROM users WHERE verified = 1');
+    const blockedUsers = await db.getAsync('SELECT COUNT(*) as count FROM users WHERE blocked = 1');
+    const totalBalance = await db.getAsync('SELECT SUM(balance) as total FROM users');
+    const plans = await db.allAsync(`
       SELECT selectedPlan, COUNT(*) as count
       FROM users
       WHERE selectedPlan IS NOT NULL
       GROUP BY selectedPlan
-    `).all();
+    `);
 
-    const recentTransactions = db.prepare(`
-      SELECT * FROM transactions ORDER BY createdAt DESC LIMIT 20
-    `).all();
-
-    const deposits = db.prepare(`
-      SELECT SUM(amount) as total FROM transactions WHERE type = 'deposit' AND status = 'completed'
-    `).get();
-    const withdrawals = db.prepare(`
-      SELECT SUM(amount) as total FROM transactions WHERE type = 'withdrawal' AND status = 'completed'
-    `).get();
+    const recentTransactions = await db.allAsync('SELECT * FROM transactions ORDER BY createdAt DESC LIMIT 20');
+    const deposits = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = "deposit" AND status = "completed"');
+    const withdrawals = await db.getAsync('SELECT SUM(amount) as total FROM transactions WHERE type = "withdrawal" AND status = "completed"');
 
     res.json({
       users: {
-        total: totalUsers.count,
-        verified: verifiedUsers.count,
-        blocked: blockedUsers.count,
+        total: totalUsers ? totalUsers.count : 0,
+        verified: verifiedUsers ? verifiedUsers.count : 0,
+        blocked: blockedUsers ? blockedUsers.count : 0,
       },
       finances: {
-        totalBalance: totalBalance.total || 0,
-        totalDeposits: deposits.total || 0,
-        totalWithdrawals: withdrawals.total || 0,
+        totalBalance: totalBalance ? totalBalance.total || 0 : 0,
+        totalDeposits: deposits ? deposits.total || 0 : 0,
+        totalWithdrawals: withdrawals ? withdrawals.total || 0 : 0,
       },
       plans: plans.map(p => ({ plan: p.selectedPlan, count: p.count })),
       recentTransactions: recentTransactions.map(rowToTransaction),
@@ -2967,20 +2809,20 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
   }
 });
 
-app.put('/api/admin/users/:id/block', authMiddleware, adminMiddleware, (req, res) => {
+app.put('/api/admin/users/:id/block', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { block } = req.body;
     if (typeof block !== 'boolean') return res.status(400).json({ error: 'Block must be true/false.' });
 
     const userId = req.params.id;
-    const userRow = db.prepare('SELECT id FROM users WHERE id = ?').get(userId);
+    const userRow = await db.getAsync('SELECT id FROM users WHERE id = ?', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET blocked = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `).run(block ? 1 : 0, userId);
+    `, block ? 1 : 0, userId);
 
-    const user = db.prepare('SELECT name, email FROM users WHERE id = ?').get(userId);
+    const user = await db.getAsync('SELECT name, email FROM users WHERE id = ?', userId);
     log('info', `User ${block ? 'blocked' : 'unblocked'}: ${user.email} (ID: ${userId})`);
     res.json({ message: `User ${block ? 'blocked' : 'unblocked'} successfully.` });
   } catch (error) {
@@ -2989,7 +2831,7 @@ app.put('/api/admin/users/:id/block', authMiddleware, adminMiddleware, (req, res
   }
 });
 
-app.put('/api/admin/users/:id/balance', authMiddleware, adminMiddleware, (req, res) => {
+app.put('/api/admin/users/:id/balance', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { balance } = req.body;
     if (typeof balance !== 'number' || balance < 0) {
@@ -2997,20 +2839,20 @@ app.put('/api/admin/users/:id/balance', authMiddleware, adminMiddleware, (req, r
     }
 
     const userId = req.params.id;
-    const userRow = db.prepare('SELECT id, name, email, balance FROM users WHERE id = ?').get(userId);
+    const userRow = await db.getAsync('SELECT id, name, email, balance FROM users WHERE id = ?', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
 
     const previousBalance = userRow.balance;
-    db.prepare(`
+    await db.runAsync(`
       UPDATE users SET balance = ?, updatedAt = strftime('%s', 'now') WHERE id = ?
-    `).run(balance, userId);
+    `, balance, userId);
 
     const diff = balance - previousBalance;
     if (diff !== 0) {
-      db.prepare(`
+      await db.runAsync(`
         INSERT INTO transactions (userId, type, amount, status, description, reference)
         VALUES (?, 'trade', ?, 'completed', 'Admin balance adjustment', ?)
-      `).run(userId, Math.abs(diff), generateReference());
+      `, userId, Math.abs(diff), generateReference());
     }
 
     log('info', `Balance updated for user ${userRow.email}: $${previousBalance} -> $${balance}`);
@@ -3021,7 +2863,7 @@ app.put('/api/admin/users/:id/balance', authMiddleware, adminMiddleware, (req, r
   }
 });
 
-app.get('/api/admin/transactions', authMiddleware, adminMiddleware, (req, res) => {
+app.get('/api/admin/transactions', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { limit = 100, offset = 0, type, status } = req.query;
     let query = 'SELECT * FROM transactions';
@@ -3035,12 +2877,13 @@ app.get('/api/admin/transactions', authMiddleware, adminMiddleware, (req, res) =
     query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
     params.push(parseInt(limit), parseInt(offset));
 
-    const rows = db.prepare(query).all(...params);
+    const rows = await db.allAsync(query, ...params);
     const transactions = rows.map(rowToTransaction);
 
     let countQuery = 'SELECT COUNT(*) as total FROM transactions';
     if (conditions.length > 0) countQuery += ' WHERE ' + conditions.join(' AND ');
-    const total = db.prepare(countQuery).get(...params.slice(0, -2)).total;
+    const totalRow = await db.getAsync(countQuery, ...params.slice(0, -2));
+    const total = totalRow ? totalRow.total : 0;
 
     res.json({ transactions, pagination: { total, limit: parseInt(limit), offset: parseInt(offset) } });
   } catch (error) {
@@ -3061,86 +2904,57 @@ app.get('/api/exchange-rates', async (req, res) => {
 });
 
 // Reset user data (admin only or user self-reset)
-// Reset user data (admin only or user self-reset)
 app.post('/api/user/reset', authMiddleware, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { action } = req.body; // 'balance', 'plan', 'holdings', 'transactions', 'profile', 'all'
+        const { action } = req.body;
 
-        // Validate action
         const validActions = ['balance', 'plan', 'holdings', 'transactions', 'profile', 'all'];
         if (!validActions.includes(action)) {
             return res.status(400).json({ error: 'Invalid reset action.' });
         }
 
-        // Build queries inside a transaction
-        const executeReset = db.transaction(() => {
-            switch (action) {
-                case 'balance':
-                    // Reset balance to the $50 bonus
-                    db.prepare(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`).run(userId);
-                    break;
+        await db.execAsync('BEGIN TRANSACTION');
+        switch (action) {
+            case 'balance':
+                await db.runAsync(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                break;
+            case 'plan':
+                await db.runAsync(`UPDATE users SET selectedPlan = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                break;
+            case 'holdings':
+                await db.runAsync(`DELETE FROM holdings WHERE userId = ?`, userId);
+                break;
+            case 'transactions':
+                await db.runAsync(`DELETE FROM transactions WHERE userId = ?`, userId);
+                const bonusRef = generateReference();
+                await db.runAsync(`
+                    INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+                    VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
+                `, userId, bonusRef);
+                await db.runAsync(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`, userId);
+                break;
+            case 'profile':
+                await db.runAsync(`
+                    UPDATE users SET profilePicture = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?
+                `, userId);
+                break;
+            case 'all':
+                await db.runAsync(`DELETE FROM holdings WHERE userId = ?`, userId);
+                await db.runAsync(`DELETE FROM transactions WHERE userId = ?`, userId);
+                const allBonusRef = generateReference();
+                await db.runAsync(`
+                    INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
+                    VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
+                `, userId, allBonusRef);
+                await db.runAsync(`
+                    UPDATE users SET balance = 50, selectedPlan = NULL, profilePicture = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?
+                `, userId);
+                break;
+        }
+        await db.execAsync('COMMIT');
 
-                case 'plan':
-                    db.prepare(`UPDATE users SET selectedPlan = NULL, updatedAt = strftime('%s', 'now') WHERE id = ?`).run(userId);
-                    break;
-
-                case 'holdings':
-                    db.prepare(`DELETE FROM holdings WHERE userId = ?`).run(userId);
-                    break;
-
-                case 'transactions':
-                    // Delete all transactions, then re-add the $50 bonus
-                    db.prepare(`DELETE FROM transactions WHERE userId = ?`).run(userId);
-                    const bonusRef = generateReference();
-                    db.prepare(`
-                        INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
-                        VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
-                    `).run(userId, bonusRef);
-                    // Set balance to 50
-                    db.prepare(`UPDATE users SET balance = 50, updatedAt = strftime('%s', 'now') WHERE id = ?`).run(userId);
-                    break;
-
-                case 'profile':
-                    // Only clear the profile picture – keep name, phone, country unchanged
-                    db.prepare(`
-                        UPDATE users SET 
-                            profilePicture = NULL,
-                            updatedAt = strftime('%s', 'now')
-                        WHERE id = ?
-                    `).run(userId);
-                    break;
-
-                case 'all':
-                    // Reset EVERYTHING except name, phone, country
-                    // 1. Delete holdings
-                    db.prepare(`DELETE FROM holdings WHERE userId = ?`).run(userId);
-                    // 2. Delete all transactions
-                    db.prepare(`DELETE FROM transactions WHERE userId = ?`).run(userId);
-                    // 3. Insert bonus transaction
-                    const allBonusRef = generateReference();
-                    db.prepare(`
-                        INSERT INTO transactions (userId, type, amount, status, description, reference, createdAt, updatedAt)
-                        VALUES (?, 'bonus', 50, 'completed', 'Welcome bonus – $50 signup bonus', ?, strftime('%s', 'now'), strftime('%s', 'now'))
-                    `).run(userId, allBonusRef);
-                    // 4. Reset balance to 50, clear plan, clear profile picture
-                    //    DO NOT change name, phone, country
-                    db.prepare(`
-                        UPDATE users SET 
-                            balance = 50,
-                            selectedPlan = NULL,
-                            profilePicture = NULL,
-                            updatedAt = strftime('%s', 'now')
-                        WHERE id = ?
-                    `).run(userId);
-                    break;
-            }
-        });
-
-        executeReset();
-
-        // Fetch updated user data
-        const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+        const userRow = await db.getAsync('SELECT * FROM users WHERE id = ?', userId);
         if (!userRow) {
             return res.status(404).json({ error: 'User not found after reset.' });
         }
@@ -3149,8 +2963,7 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
         delete user.verificationCode;
         delete user.verificationCodeExpires;
 
-        // Also fetch the fresh transaction list (for the frontend to reflect new history)
-        const transactions = db.prepare('SELECT * FROM transactions WHERE userId = ? ORDER BY createdAt DESC').all(userId);
+        const transactions = await db.allAsync('SELECT * FROM transactions WHERE userId = ? ORDER BY createdAt DESC', userId);
 
         log('info', `User ${userId} reset ${action}`);
         res.json({
@@ -3159,21 +2972,22 @@ app.post('/api/user/reset', authMiddleware, async (req, res) => {
             transactions: transactions.map(rowToTransaction),
         });
     } catch (error) {
+        await db.execAsync('ROLLBACK');
         log('error', 'Reset error', error);
         res.status(500).json({ error: 'Server error during reset.' });
     }
 });
 
-app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) => {
+app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const userId = req.params.id;
-    const userRow = db.prepare('SELECT id, email FROM users WHERE id = ?').get(userId);
+    const userRow = await db.getAsync('SELECT id, email FROM users WHERE id = ?', userId);
     if (!userRow) return res.status(404).json({ error: 'User not found.' });
     if (parseInt(userId) === req.user.id) {
       return res.status(400).json({ error: 'Cannot delete your own account.' });
     }
 
-    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+    await db.runAsync('DELETE FROM users WHERE id = ?', userId);
     log('info', `User deleted: ${userRow.email} (ID: ${userId})`);
     res.json({ message: 'User deleted successfully.' });
   } catch (error) {
@@ -3204,16 +3018,28 @@ app.use((err, req, res, next) => {
 // START SERVER
 // ================================================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 API available at http://localhost:${PORT}/api`);
-  console.log(`🎁 New users get $50 signup bonus!`);
-  console.log(`💰 Plan prices: Starter $100, Basic $500, Pro $1500, Elite $3500, Enterprise $7500, Titan $15000`);
-  console.log(`🪙 Supported crypto: ${SUPPORTED_SYMBOLS.join(', ')}`);
-  console.log(`📊 Price & conversion endpoints available at /api/prices and /api/convert`);
-  console.log(`🛟 Support tickets endpoint: /api/user/support`);
-  console.log(`🔄 Portfolio refresh endpoint: /api/user/refresh-portfolio (respects daily limits)`);
-});
+
+// Initialize database and then start server
+initDatabase()
+  .then(() => {
+    console.log('✅ Database ready – starting server...');
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`📡 API available at http://localhost:${PORT}/api`);
+      console.log(`🎁 New users get $50 signup bonus!`);
+      console.log(`💰 Plan prices: Starter $100, Basic $500, Pro $1500, Elite $3500, Enterprise $7500, Titan $15000`);
+      console.log(`🪙 Supported crypto: ${SUPPORTED_SYMBOLS.join(', ')}`);
+      console.log(`📊 Price & conversion endpoints available at /api/prices and /api/convert`);
+      console.log(`🛟 Support tickets endpoint: /api/user/support`);
+      console.log(`🔄 Portfolio refresh endpoint: /api/user/refresh-portfolio (respects daily limits)`);
+    });
+  })
+  .catch((err) => {
+    console.error('❌ Database initialization failed, but server will still try to start:', err);
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT} (but DB may have errors)`);
+    });
+  });
 
 process.on('unhandledRejection', (err) => {
   console.error('UNHANDLED REJECTION:', err);
