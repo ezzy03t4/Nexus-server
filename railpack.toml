@@ -1,9 +1,6 @@
-[providers]
-nixpacks.providers = ["node"]
+[phases.setup]
+aptPackages = ["python3.12-distutils"]
 
 [phases.install]
 dependsOn = ["setup"]
 cmds = ["npm install"]
-
-[apt]
-packages = ["python3.12-distutils"]
