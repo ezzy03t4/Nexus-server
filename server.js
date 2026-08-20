@@ -1168,10 +1168,17 @@ app.post('/api/auth/register', async (req, res) => {
       message: 'Registration successful. Check your email for verification code. You received $50 signup bonus!',
       userId: userId,
     });
-  } catch (error) {
-    log('error', 'Registration error', error);
-    res.status(500).json({ error: 'Server error during registration.' });
-  }
+  }catch (error) {
+  console.error('🔥 Registration error details:', error);
+  console.error('🔥 Stack trace:', error?.stack);
+  log('error', 'Registration error', {
+    message: error?.message || String(error),
+    stack: error?.stack,
+    name: error?.name,
+    code: error?.code
+  });
+  res.status(500).json({ error: 'Server error during registration.' });
+}
 });
 
 app.post('/api/auth/verify', async (req, res) => {
