@@ -2018,6 +2018,22 @@ app.get('/api/user/notifications', authMiddleware, async (req, res) => {
   }
 });
 
+// ================================================================
+// MARK NOTIFICATIONS AS READ
+// ================================================================
+app.put('/api/user/notifications/read', authMiddleware, async (req, res) => {
+  try {
+    await db.runAsync(
+      `UPDATE notifications SET isRead = 1 WHERE userId = $1 AND isRead = 0`,
+      req.user.id
+    );
+    res.json({ message: 'All notifications marked as read.' });
+  } catch (error) {
+    log('error', 'Mark read error', error);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 app.put('/api/admin/users/:id/plan', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const userId = req.params.id;
