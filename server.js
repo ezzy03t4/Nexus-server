@@ -2883,7 +2883,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
 app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const row = await db.getAsync(`
-      SELECT id, name, email, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
+      SELECT id, name, email, password, country, phone, selectedPlan, balance, profilePicture, isAdmin, blocked, verified, createdAt
       FROM users WHERE id = $1
     `, req.params.id);
     if (!row) return res.status(404).json({ error: 'User not found.' });
