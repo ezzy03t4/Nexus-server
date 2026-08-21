@@ -103,7 +103,7 @@ app.use(rateLimiter);
 // ================================================================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false
+  ssl: { rejectUnauthorized: false }   // accept self‑signed cert
 });
 
 // Helper to get current Unix timestamp (seconds)
@@ -304,8 +304,7 @@ async function initDatabase() {
     { name: 'verificationCodeExpires', type: 'INTEGER' }
   ];
   for (const col of userColumnsToAdd) {
-    // Case-insensitive check
-    if (!existingUserCols.some(c => c.toLowerCase() === col.name.toLowerCase())) {
+    if (!existingUserCols.includes(col.name)) {
       console.log(`🔄 Adding ${col.name} column to users...`);
       await db.execAsync(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`);
       console.log(`✅ ${col.name} column added.`);
@@ -332,7 +331,7 @@ async function initDatabase() {
     { name: 'feeAmount', type: 'REAL DEFAULT 0' }
   ];
   for (const col of txColumnsToAdd) {
-    if (!existingTxCols.some(c => c.toLowerCase() === col.name.toLowerCase())) {
+    if (!existingTxCols.includes(col.name)) {
       console.log(`🔄 Adding ${col.name} column to transactions...`);
       await db.execAsync(`ALTER TABLE transactions ADD COLUMN ${col.name} ${col.type}`);
       console.log(`✅ ${col.name} column added.`);
@@ -352,7 +351,7 @@ async function initDatabase() {
     { name: 'updatedAt', type: 'INTEGER DEFAULT 0' }
   ];
   for (const col of supportColumnsToAdd) {
-    if (!existingSupportCols.some(c => c.toLowerCase() === col.name.toLowerCase())) {
+    if (!existingSupportCols.includes(col.name)) {
       console.log(`🔄 Adding ${col.name} column to support_tickets...`);
       await db.execAsync(`ALTER TABLE support_tickets ADD COLUMN ${col.name} ${col.type}`);
       console.log(`✅ ${col.name} column added.`);
@@ -360,7 +359,6 @@ async function initDatabase() {
   }
   await db.execAsync(`UPDATE support_tickets SET updatedAt = EXTRACT(EPOCH FROM NOW())::INT WHERE updatedAt IS NULL OR updatedAt = 0`);
 
-  // (Optional) Recreate transactions check constraint for plan_purchase – already included in CREATE TABLE, so skip.
   console.log('✅ Database schema and migrations applied.');
 }
 
