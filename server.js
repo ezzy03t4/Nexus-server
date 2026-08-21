@@ -2003,34 +2003,96 @@ app.post('/api/admin/notify', authMiddleware, adminMiddleware, async (req, res) 
   }
 });
 
-app.get('/api/user/notifications', authMiddleware, async (req, res) => {
+// ================================================================
+// DELETE NOTIFICATION (single)
+// ================================================================
+app.delete('/api/user/notifications/:id', authMiddleware, async (req, res) => {
   try {
-    const notifications = await db.allAsync(`
-      SELECT * FROM notifications
-      WHERE userId = $1
-      ORDER BY createdAt DESC
-      LIMIT 50
-    `, req.user.id);
-    res.json({ notifications });
+    const id = parseInt(req.params.id);
+    const userId = req.user.id;
+    const result = await db.runAsync(
+      'DELETE FROM notifications WHERE id = $1 AND userId = $2',
+      id, userId
+    );
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    res.json({ message: 'Notification deleted' });
   } catch (error) {
-    log('error', 'Get notifications error', error);
-    res.status(500).json({ error: 'Server error.' });
+    log('error', 'Delete notification error', error);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ================================================================
-// MARK NOTIFICATIONS AS READ
+// DELETE MULTIPLE NOTIFICATIONS
 // ================================================================
-app.put('/api/user/notifications/read', authMiddleware, async (req, res) => {
+app.delete('/api/user/notifications', authMiddleware, async (req, res) => {
   try {
-    await db.runAsync(
-      `UPDATE notifications SET isRead = 1 WHERE userId = $1 AND isRead = 0`,
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'Invalid ids' });
+    }
+    const userId = req.user.id;
+    // Build the placeholders for the IN clause
+    const placeholders = ids.map((_, i) => `$${i + 2}`).join(',');
+    const query = `DELETE FROM notifications WHERE id IN (${placeholders}) AND userId = $1`;
+    const params = [userId, ...ids];
+    const result = await db.runAsync(query, ...params);
+    res.json({ message: `${result.changes} notifications deleted` });
+  } catch (error) {
+    log('error', 'Delete notifications error', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ================================================================
+// REPLY TO NOTIFICATION (send email to admin)
+// ================================================================
+app.post('/api/user/notifications/reply', authMiddleware, async (req, res) => {
+  try {
+    const { notificationId, message } = req.body;
+    if (!notificationId || !message) {
+      return res.status(400).json({ error: 'Notification ID and message required' });
+    }
+    // Fetch the notification to get its title
+    const notif = await db.getAsync(
+      'SELECT * FROM notifications WHERE id = $1 AND userId = $2',
+      notificationId, req.user.id
+    );
+    if (!notif) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    // Get user info
+    const user = await db.getAsync(
+      'SELECT name, email FROM users WHERE id = $1',
       req.user.id
     );
-    res.json({ message: 'All notifications marked as read.' });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const adminEmail = 'nexusai58@gmail.com'; // or use process.env.ADMIN_EMAIL
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: adminEmail,
+      subject: `Reply to notification: ${notif.title}`,
+      html: `
+        <div style="font-family:Arial;max-width:600px;margin:0 auto;padding:20px;background:#0b0b0e;color:#f0f0f5;border-radius:12px;">
+          <h2 style="color:var(--accent-2);">Reply from ${user.name} (${user.email})</h2>
+          <p><strong>Original Notification:</strong> ${notif.title}</p>
+          <p><strong>Message:</strong></p>
+          <div style="background:#14141f;padding:16px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);">
+            <p style="white-space:pre-wrap;color:#f0f0f5;">${message}</p>
+          </div>
+          <hr style="border-color:rgba(255,255,255,0.04);" />
+          <p style="color:#6a6a82;font-size:12px;text-align:center;">© 2026 Nexus AI</p>
+        </div>
+      `
+    });
+    res.json({ message: 'Reply sent to admin' });
   } catch (error) {
-    log('error', 'Mark read error', error);
-    res.status(500).json({ error: 'Server error.' });
+    log('error', 'Reply notification error', error);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
