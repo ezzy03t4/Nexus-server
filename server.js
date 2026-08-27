@@ -771,35 +771,35 @@ app.get('/api/convert', async (req, res) => {
 });
 
 // ================================================================
-// EMAIL UTILITY
+// EMAIL UTILITY (Now using Resend API – same interface)
 // ================================================================
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_API_KEY = process.env.BREVO_API_KEY; // This will hold your Resend API key
 
 const transporter = {
   sendMail: async (mailOptions) => {
     try {
       const { from, to, subject, html } = mailOptions;
-      const senderEmail = from || process.env.EMAIL_USER || 'nexusai58@gmail.com';
+      const senderEmail = from || process.env.EMAIL_USER || 'onboarding@resend.dev';
 
       const response = await axios.post(
-        'https://api.brevo.com/v3/smtp/email',
+        'https://api.resend.com/emails',
         {
-          sender: { email: senderEmail, name: 'Nexus AI' },
-          to: [{ email: to }],
+          from: senderEmail,
+          to: [to],
           subject: subject,
-          htmlContent: html,
+          html: html,
         },
         {
           headers: {
-            'api-key': BREVO_API_KEY,
+            'Authorization': `Bearer ${BREVO_API_KEY}`,
             'Content-Type': 'application/json',
           },
         }
       );
-      console.log('✅ Email sent via Brevo API:', response.data);
+      console.log('✅ Email sent via Resend API:', response.data);
       return response.data;
     } catch (error) {
-      console.error('❌ Brevo API error:', error.response?.data || error.message);
+      console.error('❌ Resend API error:', error.response?.data || error.message);
       throw error;
     }
   }
