@@ -771,44 +771,50 @@ app.get('/api/convert', async (req, res) => {
 });
 
 // ================================================================
-// EMAIL UTILITY (MailerSend API – works on Render free tier)
+// EMAIL UTILITY (SendGrid API – free, no recipient limit, works on Render)
 // ================================================================
-const BREVO_API_KEY = process.env.BREVO_API_KEY; // Holds your MailerSend API key
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
 
 const transporter = {
   sendMail: async (mailOptions) => {
     try {
-      const { from, to, subject, html } = mailOptions;
-      const senderEmail = from || process.env.EMAIL_USER || 'info@mailersend.net';
+      const { from, to, subject, html, attachments } = mailOptions;
+      const senderEmail = from || process.env.EMAIL_USER || 'nexusai58@gmail.com';
+
+      // Build the payload for SendGrid
+      const payload = {
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: senderEmail, name: 'Nexus AI' },
+        subject: subject,
+        content: [{ type: 'text/html', value: html }],
+      };
+
+      // Add attachments if any
+      if (attachments && attachments.length > 0) {
+        payload.attachments = attachments.map(att => ({
+          filename: att.filename,
+          content: att.content,          // base64 string without the "data:image/..." prefix
+          type: att.contentType || 'application/octet-stream',
+          disposition: 'attachment',
+        }));
+      }
 
       const response = await axios.post(
-        'https://api.mailersend.com/v1/email',
-        {
-          from: {
-            email: senderEmail,
-            name: 'Nexus AI'
-          },
-          to: [
-            {
-              email: to,
-              name: 'User'
-            }
-          ],
-          subject: subject,
-          html: html,
-          text: 'Please enable HTML to view this email.' // fallback
-        },
+        'https://api.sendgrid.com/v3/mail/send',
+        payload,
         {
           headers: {
-            'Authorization': `Bearer ${BREVO_API_KEY}`,
+            'Authorization': `Bearer ${SENDGRID_API_KEY}`,
             'Content-Type': 'application/json',
           },
         }
       );
-      console.log('✅ Email sent via MailerSend API:', response.data);
-      return response.data;
+
+      // SendGrid returns 202 on success
+      console.log('✅ Email sent via SendGrid (202 accepted)');
+      return { status: 202 };
     } catch (error) {
-      console.error('❌ MailerSend API error:', error.response?.data || error.message);
+      console.error('❌ SendGrid error:', error.response?.data || error.message);
       throw error;
     }
   }
