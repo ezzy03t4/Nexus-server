@@ -771,23 +771,32 @@ app.get('/api/convert', async (req, res) => {
 });
 
 // ================================================================
-// EMAIL UTILITY (Now using Resend API – same interface)
+// EMAIL UTILITY (MailerSend API – works on Render free tier)
 // ================================================================
-const BREVO_API_KEY = process.env.BREVO_API_KEY; // This will hold your Resend API key
+const BREVO_API_KEY = process.env.BREVO_API_KEY; // Holds your MailerSend API key
 
 const transporter = {
   sendMail: async (mailOptions) => {
     try {
       const { from, to, subject, html } = mailOptions;
-      const senderEmail = from || process.env.EMAIL_USER || 'onboarding@resend.dev';
+      const senderEmail = from || process.env.EMAIL_USER || 'info@mailersend.net';
 
       const response = await axios.post(
-        'https://api.resend.com/emails',
+        'https://api.mailersend.com/v1/email',
         {
-          from: senderEmail,
-          to: [to],
+          from: {
+            email: senderEmail,
+            name: 'Nexus AI'
+          },
+          to: [
+            {
+              email: to,
+              name: 'User'
+            }
+          ],
           subject: subject,
           html: html,
+          text: 'Please enable HTML to view this email.' // fallback
         },
         {
           headers: {
@@ -796,10 +805,10 @@ const transporter = {
           },
         }
       );
-      console.log('✅ Email sent via Resend API:', response.data);
+      console.log('✅ Email sent via MailerSend API:', response.data);
       return response.data;
     } catch (error) {
-      console.error('❌ Resend API error:', error.response?.data || error.message);
+      console.error('❌ MailerSend API error:', error.response?.data || error.message);
       throw error;
     }
   }
