@@ -1556,6 +1556,8 @@ app.get('/api/user/balance', authMiddleware, async (req, res) => {
 app.post('/api/user/deposit', authMiddleware, async (req, res) => {
     try {
         const { amount, method, proof, currency = 'USD' } = req.body;
+        
+        // --- Validate amount ---
         if (!amount || parseFloat(amount) <= 0) {
             return res.status(400).json({ error: 'Valid amount is required.' });
         }
@@ -1568,6 +1570,7 @@ app.post('/api/user/deposit', authMiddleware, async (req, res) => {
         let feePercent = 2.5;
         let feeAmount = 0;
 
+        // --- Get exchange rates ---
         const rates = await getExchangeRates();
 
         if (originalCurrency !== 'USD') {
@@ -1579,18 +1582,22 @@ app.post('/api/user/deposit', authMiddleware, async (req, res) => {
             usdAmount = depositAmount * exchangeRate;
         }
 
+        // --- Calculate fees ---
         feeAmount = usdAmount * (feePercent / 100);
         const finalUsdAmount = usdAmount - feeAmount;
 
+        // --- Minimum deposit check ---
         if (finalUsdAmount < 10) {
             return res.status(400).json({
                 error: `Minimum deposit is $10 USD after fees. Your deposit of ${originalAmount} ${originalCurrency} is worth $${usdAmount.toFixed(2)} (after ${feePercent}% fee: $${finalUsdAmount.toFixed(2)}).`
             });
         }
 
+        // --- Generate reference and description ---
         const reference = generateReference();
         const description = `Deposit via ${method || 'bank'} (${originalAmount} ${originalCurrency} → $${usdAmount.toFixed(2)} USD, fee: ${feePercent}%)`;
 
+        // --- Insert transaction into database ---
         const info = await db.runAsync(`
             INSERT INTO transactions (
                 userId, type, amount, status, method, description, reference, proof,
@@ -1598,12 +1605,15 @@ app.post('/api/user/deposit', authMiddleware, async (req, res) => {
             ) VALUES ($1, 'deposit', $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
         `, req.user.id, finalUsdAmount, method || 'bank', description, reference, proof || null,
             originalCurrency, originalAmount, exchangeRate, feePercent, feeAmount, nowUnix());
+        
         const transactionId = info.lastInsertRowid;
         const transactionRow = await db.getAsync('SELECT * FROM transactions WHERE id = $1', transactionId);
         const transaction = rowToTransaction(transactionRow);
 
+        // --- Send admin notification email with proof (if provided) ---
         const userRow = await db.getAsync('SELECT name, email FROM users WHERE id = $1', req.user.id);
         if (userRow) {
+            // proof is either a base64 data URL (string) or null
             await sendDepositNotificationEmail(userRow.email, userRow.name, transaction, proof || null);
         }
 
