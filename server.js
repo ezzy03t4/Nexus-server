@@ -1878,7 +1878,7 @@ app.post('/api/user/deposit/proof/:id', authMiddleware, upload.single('proofFile
       const base64 = fileBuffer.toString('base64');
       const mimeType = req.file.mimetype;
       proofData = `data:${mimeType};base64,${base64}`;
-      proofData = req.file.path;
+      // ❌ Delete this line: proofData = req.file.path;
     } else if (req.body.proof) {
       proofData = req.body.proof;
     }
